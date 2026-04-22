@@ -55,12 +55,110 @@ def _normalize_skill_list(skill: Optional[str] = None, skills: Optional[Any] = N
     return normalized
 
 
+def _default_health() -> Dict[str, Any]:
+    return {
+        "total_runs": 0,
+        "total_successes": 0,
+        "total_failures": 0,
+        "consecutive_failures": 0,
+        "success_rate": None,
+        "last_success_at": None,
+        "last_failure_at": None,
+    }
+
+
+def _normalize_health(health: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    normalized = _default_health()
+    if isinstance(health, dict):
+        for key in normalized:
+            if key in health:
+                normalized[key] = health[key]
+    return normalized
+
+
+def _normalize_reactive_trigger(trigger: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if trigger in (None, {}):
+        return None
+    if not isinstance(trigger, dict):
+        raise ValueError("reactive_trigger must be an object")
+
+    job_id = str(trigger.get("job_id") or "").strip()
+    if not job_id:
+        raise ValueError("reactive_trigger.job_id is required")
+
+    raw_threshold = trigger.get("after_consecutive_failures", 1)
+    try:
+        threshold = int(raw_threshold)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("reactive_trigger.after_consecutive_failures must be an integer") from exc
+    if threshold < 1:
+        raise ValueError("reactive_trigger.after_consecutive_failures must be >= 1")
+
+    last_seen_failure_at = trigger.get("last_seen_failure_at")
+    if last_seen_failure_at is not None:
+        last_seen_failure_at = str(last_seen_failure_at).strip() or None
+
+    return {
+        "job_id": job_id,
+        "after_consecutive_failures": threshold,
+        "last_seen_failure_at": last_seen_failure_at,
+    }
+
+
+def _validate_runtime_base_url(base_url: Optional[str]) -> Optional[str]:
+    if not base_url:
+        return None
+    from urllib.parse import urlparse
+
+    parsed = urlparse(base_url)
+    if parsed.hostname in {"localhost", "127.0.0.1", "::1"} and parsed.scheme in {"http", "https"}:
+        return None
+    return "Cron job base_url overrides are restricted to explicit localhost endpoints."
+
+
+
+def _would_create_reactive_cycle(job_id: str, trigger_source_job_id: str, jobs: List[Dict[str, Any]]) -> bool:
+    """Return True if wiring job_id -> trigger_source_job_id would create a trigger cycle."""
+    current = trigger_source_job_id
+    seen: set[str] = set()
+    normalized_jobs = {job["id"]: _apply_skill_fields(job) for job in jobs if job.get("id")}
+    while current:
+        if current == job_id:
+            return True
+        if current in seen:
+            return False
+        seen.add(current)
+        current_job = normalized_jobs.get(current)
+        if not current_job:
+            return False
+        trigger = current_job.get("reactive_trigger")
+        current = trigger.get("job_id") if trigger else None
+    return False
+
+def _has_reactive_dependents(job_id: str, jobs: List[Dict[str, Any]]) -> bool:
+    for job in jobs:
+        trigger = _apply_skill_fields(job).get("reactive_trigger")
+        if trigger and trigger.get("job_id") == job_id:
+            return True
+    return False
+
+
+from gateway.session_context import get_session_env
+def _ensure_cron_mutation_allowed(action: str) -> None:
+    if get_session_env("HERMES_CRON_SESSION") == "1":
+        raise RuntimeError(
+            f"Cron-run sessions may not {action}. They may inspect and pause existing jobs only."
+        )
 def _apply_skill_fields(job: Dict[str, Any]) -> Dict[str, Any]:
-    """Return a job dict with canonical `skills` and legacy `skill` fields aligned."""
+    """Return a job dict with canonical skill, health, and trigger fields aligned."""
     normalized = dict(job)
     skills = _normalize_skill_list(normalized.get("skill"), normalized.get("skills"))
     normalized["skills"] = skills
     normalized["skill"] = skills[0] if skills else None
+    normalized["health"] = _normalize_health(normalized.get("health"))
+    normalized["reactive_trigger"] = _normalize_reactive_trigger(normalized.get("reactive_trigger"))
+    if normalized.get("schedule") is None and normalized.get("reactive_trigger") and not normalized.get("schedule_display"):
+        normalized["schedule_display"] = "reactive"
     return normalized
 
 
@@ -367,7 +465,7 @@ def save_jobs(jobs: List[Dict[str, Any]]):
 
 def create_job(
     prompt: str,
-    schedule: str,
+    schedule: Optional[str] = None,
     name: Optional[str] = None,
     repeat: Optional[int] = None,
     deliver: Optional[str] = None,
@@ -378,37 +476,39 @@ def create_job(
     provider: Optional[str] = None,
     base_url: Optional[str] = None,
     script: Optional[str] = None,
-) -> Dict[str, Any]:
-    """
-    Create a new cron job.
+    reactive_trigger: Optional[Dict[str, Any]] = None,
+ ) -> Dict[str, Any]:
+    """Create a new cron job."""
+    if prompt:
+        from tools.cronjob_tools import _scan_cron_prompt, _validate_cron_script_path
+        scan_error = _scan_cron_prompt(prompt)
+        if scan_error:
+            raise ValueError(scan_error)
+    if script:
+        from tools.cronjob_tools import _validate_cron_script_path
+        script_error = _validate_cron_script_path(script)
+        if script_error:
+            raise ValueError(script_error)
+    runtime_error = _validate_runtime_base_url(base_url)
+    if runtime_error:
+        raise ValueError(runtime_error)
 
-    Args:
-        prompt: The prompt to run (must be self-contained, or a task instruction when skill is set)
-        schedule: Schedule string (see parse_schedule)
-        name: Optional friendly name
-        repeat: How many times to run (None = forever, 1 = once)
-        deliver: Where to deliver output ("origin", "local", "telegram", etc.)
-        origin: Source info where job was created (for "origin" delivery)
-        skill: Optional legacy single skill name to load before running the prompt
-        skills: Optional ordered list of skills to load before running the prompt
-        model: Optional per-job model override
-        provider: Optional per-job provider override
-        base_url: Optional per-job base URL override
-        script: Optional path to a Python script whose stdout is injected into the
-                prompt each run.  The script runs before the agent turn, and its output
-                is prepended as context.  Useful for data collection / change detection.
+    _ensure_cron_mutation_allowed("create or update cron jobs")
+    normalized_trigger = _normalize_reactive_trigger(reactive_trigger)
+    if schedule is None and normalized_trigger is None:
+        raise ValueError("Cron jobs require either a schedule or a reactive trigger")
 
-    Returns:
-        The created job dict
-    """
-    parsed_schedule = parse_schedule(schedule)
+    parsed_schedule = parse_schedule(schedule) if schedule is not None else None
+    if parsed_schedule is not None and normalized_trigger is not None:
+        raise ValueError("Cron jobs cannot be both scheduled and reactive; choose one mode")
+
 
     # Normalize repeat: treat 0 or negative values as None (infinite)
     if repeat is not None and repeat <= 0:
         repeat = None
 
     # Auto-set repeat=1 for one-shot schedules if not specified
-    if parsed_schedule["kind"] == "once" and repeat is None:
+    if parsed_schedule and parsed_schedule["kind"] == "once" and repeat is None:
         repeat = 1
 
     # Default delivery to origin if available, otherwise local
@@ -417,6 +517,16 @@ def create_job(
 
     job_id = uuid.uuid4().hex[:12]
     now = _hermes_now().isoformat()
+
+    if normalized_trigger:
+        source_job = get_job(normalized_trigger["job_id"])
+        if not source_job:
+            raise ValueError(f"Reactive trigger source job '{normalized_trigger['job_id']}' not found")
+        if source_job.get("reactive_trigger") is not None:
+            raise ValueError("Reactive trigger source job must not itself be reactive")
+        if _would_create_reactive_cycle(job_id, normalized_trigger["job_id"], load_jobs()):
+            raise ValueError("Reactive trigger would create a cycle")
+
 
     normalized_skills = _normalize_skill_list(skill, skills)
     normalized_model = str(model).strip() if isinstance(model, str) else None
@@ -429,6 +539,7 @@ def create_job(
     normalized_script = normalized_script or None
 
     label_source = (prompt or (normalized_skills[0] if normalized_skills else None)) or "cron job"
+    is_reactive_only = parsed_schedule is None and normalized_trigger is not None
     job = {
         "id": job_id,
         "name": name or label_source[:50].strip(),
@@ -440,17 +551,19 @@ def create_job(
         "base_url": normalized_base_url,
         "script": normalized_script,
         "schedule": parsed_schedule,
-        "schedule_display": parsed_schedule.get("display", schedule),
+        "schedule_display": parsed_schedule.get("display", schedule) if parsed_schedule else "reactive",
+        "reactive_trigger": normalized_trigger,
         "repeat": {
             "times": repeat,  # None = forever
             "completed": 0
         },
+        "health": _default_health(),
         "enabled": True,
-        "state": "scheduled",
+        "state": "reactive_waiting" if is_reactive_only else "scheduled",
         "paused_at": None,
         "paused_reason": None,
         "created_at": now,
-        "next_run_at": compute_next_run(parsed_schedule),
+        "next_run_at": compute_next_run(parsed_schedule) if parsed_schedule else None,
         "last_run_at": None,
         "last_status": None,
         "last_error": None,
@@ -485,6 +598,22 @@ def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
 
 
 def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if "prompt" in updates and updates.get("prompt"):
+        from tools.cronjob_tools import _scan_cron_prompt
+        scan_error = _scan_cron_prompt(str(updates.get("prompt") or ""))
+        if scan_error:
+            raise ValueError(scan_error)
+    if "script" in updates and updates.get("script"):
+        from tools.cronjob_tools import _validate_cron_script_path
+        script_error = _validate_cron_script_path(str(updates.get("script") or ""))
+        if script_error:
+            raise ValueError(script_error)
+    if "base_url" in updates:
+        runtime_error = _validate_runtime_base_url(updates.get("base_url"))
+        if runtime_error:
+            raise ValueError(runtime_error)
+
+    _ensure_cron_mutation_allowed("update cron jobs")
     """Update a job by ID, refreshing derived schedule fields when needed."""
     jobs = load_jobs()
     for i, job in enumerate(jobs):
@@ -493,28 +622,63 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
 
         updated = _apply_skill_fields({**job, **updates})
         schedule_changed = "schedule" in updates
+        trigger_changed = "reactive_trigger" in updates
 
         if "skills" in updates or "skill" in updates:
             normalized_skills = _normalize_skill_list(updated.get("skill"), updated.get("skills"))
             updated["skills"] = normalized_skills
             updated["skill"] = normalized_skills[0] if normalized_skills else None
 
-        if schedule_changed:
+        if trigger_changed:
+            updated["reactive_trigger"] = _normalize_reactive_trigger(updated.get("reactive_trigger"))
+
+            if _has_reactive_dependents(job_id, jobs):
+                raise ValueError("A job with reactive dependents cannot itself become reactive")
+        if updated.get("reactive_trigger") is not None:
+            source_job = get_job(updated["reactive_trigger"]["job_id"])
+            if not source_job:
+                raise ValueError(f"Reactive trigger source job '{updated['reactive_trigger']['job_id']}' not found")
+            if source_job["id"] == job_id:
+                raise ValueError("A cron job cannot reactively trigger itself")
+            if source_job.get("reactive_trigger") is not None:
+                raise ValueError("Reactive trigger source job must not itself be reactive")
+            other_jobs = [existing for idx, existing in enumerate(jobs) if idx != i]
+            if _would_create_reactive_cycle(job_id, updated["reactive_trigger"]["job_id"], other_jobs):
+                raise ValueError("Reactive trigger would create a cycle")
+
+
+        if updated.get("schedule") is None and updated.get("reactive_trigger") is None:
+            raise ValueError("Cron jobs require either a schedule or a reactive trigger")
+
+        if updated.get("schedule") is not None and updated.get("reactive_trigger") is not None:
+            raise ValueError("Cron jobs cannot be both scheduled and reactive; choose one mode")
+
+
+        if updated.get("schedule") is None and updated.get("reactive_trigger") and updated.get("state") != "paused":
+            updated["schedule_display"] = "reactive"
+            updated["next_run_at"] = None
+            updated["state"] = "reactive_waiting"
+            updated["enabled"] = True
+        elif schedule_changed:
             updated_schedule = updated["schedule"]
-            # The API may pass schedule as a raw string (e.g. "every 10m")
-            # instead of a pre-parsed dict.  Normalize it the same way
-            # create_job() does so downstream code can call .get() safely.
             if isinstance(updated_schedule, str):
                 updated_schedule = parse_schedule(updated_schedule)
                 updated["schedule"] = updated_schedule
             updated["schedule_display"] = updates.get(
                 "schedule_display",
-                updated_schedule.get("display", updated.get("schedule_display")),
+                updated_schedule.get("display", updated.get("schedule_display")) if updated_schedule else "reactive",
             )
             if updated.get("state") != "paused":
-                updated["next_run_at"] = compute_next_run(updated_schedule)
+                updated["next_run_at"] = compute_next_run(updated_schedule) if updated_schedule else None
+                updated["state"] = "scheduled" if updated_schedule else "reactive_waiting"
+                updated["enabled"] = True
 
-        if updated.get("enabled", True) and updated.get("state") != "paused" and not updated.get("next_run_at"):
+        if (
+            updated.get("enabled", True)
+            and updated.get("state") not in {"paused", "reactive_waiting"}
+            and not updated.get("next_run_at")
+            and updated.get("schedule")
+        ):
             updated["next_run_at"] = compute_next_run(updated["schedule"])
 
         jobs[i] = updated
@@ -525,29 +689,49 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
 
 def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Pause a job without deleting it."""
-    return update_job(
-        job_id,
-        {
-            "enabled": False,
-            "state": "paused",
-            "paused_at": _hermes_now().isoformat(),
-            "paused_reason": reason,
-        },
-    )
+    if get_session_env("HERMES_CRON_SESSION") == "1":
+        current_job_id = get_session_env("HERMES_CRON_JOB_ID", "").strip()
+        if not current_job_id:
+            raise RuntimeError("Cron-run sessions may only pause jobs when the current cron job id is known")
+        allowed_ids = {current_job_id}
+        current_job = get_job(current_job_id)
+        if current_job and current_job.get("reactive_trigger"):
+            allowed_ids.add(current_job["reactive_trigger"]["job_id"])
+        if job_id not in allowed_ids:
+            raise RuntimeError(
+                "Cron-run sessions may only pause the current job or its configured reactive source job."
+            )
+
+    jobs = load_jobs()
+    for idx, job in enumerate(jobs):
+        if job["id"] != job_id:
+            continue
+        normalized = _apply_skill_fields(job)
+        normalized["enabled"] = False
+        normalized["state"] = "paused"
+        normalized["paused_at"] = _hermes_now().isoformat()
+        normalized["paused_reason"] = reason
+        jobs[idx] = normalized
+        save_jobs(jobs)
+        return _apply_skill_fields(normalized)
+    return None
 
 
 def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
+    _ensure_cron_mutation_allowed("resume cron jobs")
     """Resume a paused job and compute the next future run from now."""
     job = get_job(job_id)
     if not job:
         return None
 
-    next_run_at = compute_next_run(job["schedule"])
+    schedule = job.get("schedule")
+    next_run_at = compute_next_run(schedule) if schedule else None
+    next_state = "scheduled" if schedule else "reactive_waiting"
     return update_job(
         job_id,
         {
             "enabled": True,
-            "state": "scheduled",
+            "state": next_state,
             "paused_at": None,
             "paused_reason": None,
             "next_run_at": next_run_at,
@@ -556,25 +740,32 @@ def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
 
 
 def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
+    _ensure_cron_mutation_allowed("trigger cron jobs")
     """Schedule a job to run on the next scheduler tick."""
-    job = get_job(job_id)
-    if not job:
-        return None
-    return update_job(
-        job_id,
-        {
-            "enabled": True,
-            "state": "scheduled",
-            "paused_at": None,
-            "paused_reason": None,
-            "next_run_at": _hermes_now().isoformat(),
-        },
-    )
+    jobs = load_jobs()
+    for idx, job in enumerate(jobs):
+        if job["id"] != job_id:
+            continue
+        normalized = _apply_skill_fields(job)
+        normalized["enabled"] = True
+        normalized["state"] = "scheduled"
+        normalized["paused_at"] = None
+        normalized["paused_reason"] = None
+        normalized["next_run_at"] = _hermes_now().isoformat()
+        jobs[idx] = normalized
+        save_jobs(jobs)
+        return _apply_skill_fields(normalized)
+    return None
 
 
 def remove_job(job_id: str) -> bool:
+    _ensure_cron_mutation_allowed("remove cron jobs")
     """Remove a job by ID."""
     jobs = load_jobs()
+    if _has_reactive_dependents(job_id, jobs):
+        raise RuntimeError(
+            f"Cannot remove job '{job_id}' while reactive dependents still reference it"
+        )
     original_len = len(jobs)
     jobs = [j for j in jobs if j["id"] != job_id]
     if len(jobs) < original_len:
@@ -583,49 +774,79 @@ def remove_job(job_id: str) -> bool:
     return False
 
 
-def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
-                 delivery_error: Optional[str] = None):
-    """
-    Mark a job as having been run.
-    
-    Updates last_run_at, last_status, increments completed count,
-    computes next_run_at, and auto-deletes if repeat limit reached.
-
-    ``delivery_error`` is tracked separately from the agent error — a job
-    can succeed (agent produced output) but fail delivery (platform down).
-    """
+def mark_job_run(
+    job_id: str,
+    success: bool,
+    error: Optional[str] = None,
+    delivery_error: Optional[str] = None,
+    reactive_failure_at: Optional[str] = None,
+ ):
+    """Mark a job as having been run and update health metrics."""
     jobs = load_jobs()
     for i, job in enumerate(jobs):
         if job["id"] == job_id:
+            normalized = _apply_skill_fields(job)
+            job.clear()
+            job.update(normalized)
+
             now = _hermes_now().isoformat()
             job["last_run_at"] = now
             job["last_status"] = "ok" if success else "error"
             job["last_error"] = error if not success else None
-            # Track delivery failures separately — cleared on successful delivery
             job["last_delivery_error"] = delivery_error
-            
-            # Increment completed count
+
+            health = _normalize_health(job.get("health"))
+            health["total_runs"] += 1
+            if success:
+                health["total_successes"] += 1
+                health["consecutive_failures"] = 0
+                health["last_success_at"] = now
+            else:
+                health["total_failures"] += 1
+                health["consecutive_failures"] += 1
+                health["last_failure_at"] = now
+            total_runs = health["total_runs"]
+            health["success_rate"] = round(health["total_successes"] / total_runs, 4) if total_runs else None
+            job["health"] = health
+
+            trigger = job.get("reactive_trigger")
+            if trigger and reactive_failure_at and success:
+                trigger["last_seen_failure_at"] = reactive_failure_at
+                job["reactive_trigger"] = trigger
+
             if job.get("repeat"):
                 job["repeat"]["completed"] = job["repeat"].get("completed", 0) + 1
-                
-                # Check if we've hit the repeat limit
+
                 times = job["repeat"].get("times")
                 completed = job["repeat"]["completed"]
                 if times is not None and times > 0 and completed >= times:
-                    # Remove the job (limit reached)
-                    jobs.pop(i)
+                    if success and not _has_reactive_dependents(job_id, jobs):
+                        jobs.pop(i)
+                        save_jobs(jobs)
+                        return
+                    job["next_run_at"] = None
+                    job["enabled"] = False
+                    job["state"] = "completed"
                     save_jobs(jobs)
                     return
-            
-            # Compute next run
-            job["next_run_at"] = compute_next_run(job["schedule"], now)
 
-            # If no next run (one-shot completed), disable
-            if job["next_run_at"] is None:
+            schedule = job.get("schedule")
+            if schedule:
+                job["next_run_at"] = compute_next_run(schedule, now)
+                if job["next_run_at"] is None:
+                    job["enabled"] = False
+                    job["state"] = "completed"
+                elif job.get("state") != "paused":
+                    job["state"] = "scheduled"
+            elif job.get("reactive_trigger"):
+                job["next_run_at"] = None
+                if job.get("state") != "paused":
+                    job["state"] = "reactive_waiting"
+                    job["enabled"] = True
+            else:
+                job["next_run_at"] = None
                 job["enabled"] = False
                 job["state"] = "completed"
-            elif job.get("state") != "paused":
-                job["state"] = "scheduled"
 
             save_jobs(jobs)
             return
@@ -634,25 +855,16 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
 
 
 def advance_next_run(job_id: str) -> bool:
-    """Preemptively advance next_run_at for a recurring job before execution.
-
-    Call this BEFORE run_job() so that if the process crashes mid-execution,
-    the job won't re-fire on the next gateway restart.  This converts the
-    scheduler from at-least-once to at-most-once for recurring jobs — missing
-    one run is far better than firing dozens of times in a crash loop.
-
-    One-shot jobs are left unchanged so they can still retry on restart.
-
-    Returns True if next_run_at was advanced, False otherwise.
-    """
+    """Preemptively advance next_run_at for a recurring scheduled job before execution."""
     jobs = load_jobs()
     for job in jobs:
         if job["id"] == job_id:
-            kind = job.get("schedule", {}).get("kind")
+            schedule = job.get("schedule") or {}
+            kind = schedule.get("kind")
             if kind not in ("cron", "interval"):
                 return False
             now = _hermes_now().isoformat()
-            new_next = compute_next_run(job["schedule"], now)
+            new_next = compute_next_run(schedule, now)
             if new_next and new_next != job.get("next_run_at"):
                 job["next_run_at"] = new_next
                 save_jobs(jobs)
@@ -662,17 +874,13 @@ def advance_next_run(job_id: str) -> bool:
 
 
 def get_due_jobs() -> List[Dict[str, Any]]:
-    """Get all jobs that are due to run now.
-
-    For recurring jobs (cron/interval), if the scheduled time is stale
-    (more than one period in the past, e.g. because the gateway was down),
-    the job is fast-forwarded to the next future run instead of firing
-    immediately.  This prevents a burst of missed jobs on gateway restart.
-    """
+    """Get all jobs that are due to run now, including reactive failure-triggered jobs."""
     now = _hermes_now()
     raw_jobs = load_jobs()
     jobs = [_apply_skill_fields(j) for j in copy.deepcopy(raw_jobs)]
+    jobs_by_id = {job["id"]: job for job in jobs}
     due = []
+    due_ids = set()
     needs_save = False
 
     for job in jobs:
@@ -680,9 +888,10 @@ def get_due_jobs() -> List[Dict[str, Any]]:
             continue
 
         next_run = job.get("next_run_at")
+        schedule = job.get("schedule") or {}
         if not next_run:
             recovered_next = _recoverable_oneshot_run_at(
-                job.get("schedule", {}),
+                schedule,
                 now,
                 last_run_at=job.get("last_run_at"),
             )
@@ -704,35 +913,64 @@ def get_due_jobs() -> List[Dict[str, Any]]:
 
         next_run_dt = _ensure_aware(datetime.fromisoformat(next_run))
         if next_run_dt <= now:
-            schedule = job.get("schedule", {})
             kind = schedule.get("kind")
 
-            # For recurring jobs, check if the scheduled time is stale
-            # (gateway was down and missed the window). Fast-forward to
-            # the next future occurrence instead of firing a stale run.
             grace = _compute_grace_seconds(schedule)
             if kind in ("cron", "interval") and (now - next_run_dt).total_seconds() > grace:
-                # Job is past its catch-up grace window — this is a stale missed run.
-                # Grace scales with schedule period: daily=2h, hourly=30m, 10min=5m.
                 new_next = compute_next_run(schedule, now.isoformat())
                 if new_next:
                     logger.info(
-                        "Job '%s' missed its scheduled time (%s, grace=%ds). "
-                        "Fast-forwarding to next run: %s",
+                        "Job '%s' missed its scheduled time (%s, grace=%ds). Fast-forwarding to next run: %s",
                         job.get("name", job["id"]),
                         next_run,
                         grace,
                         new_next,
                     )
-                    # Update the job in storage
                     for rj in raw_jobs:
                         if rj["id"] == job["id"]:
                             rj["next_run_at"] = new_next
                             needs_save = True
                             break
-                    continue  # Skip this run
+                    continue
 
             due.append(job)
+            due_ids.add(job["id"])
+
+    for job in jobs:
+        if not job.get("enabled", True):
+            continue
+        trigger = job.get("reactive_trigger")
+        if not trigger:
+            continue
+        source = jobs_by_id.get(trigger["job_id"])
+        if not source or source.get("last_status") != "error":
+            continue
+
+        source_health = _normalize_health(source.get("health"))
+        if source_health["consecutive_failures"] < trigger["after_consecutive_failures"]:
+            continue
+
+        source_failure_at = source_health.get("last_failure_at") or source.get("last_run_at")
+        if not source_failure_at or trigger.get("last_seen_failure_at") == source_failure_at:
+            continue
+
+        if job["id"] in due_ids:
+            for existing_due in due:
+                if existing_due["id"] == job["id"]:
+                    existing_due["_reactive_failure_at"] = source_failure_at
+                    break
+            continue
+
+        logger.info(
+            "Reactive trigger: job '%s' due because '%s' reached %s consecutive failures",
+            job.get("name", job["id"]),
+            source.get("name", source["id"]),
+            trigger["after_consecutive_failures"],
+        )
+        reactive_due = dict(job)
+        reactive_due["_reactive_failure_at"] = source_failure_at
+        due.append(reactive_due)
+        due_ids.add(job["id"])
 
     if needs_save:
         save_jobs(raw_jobs)

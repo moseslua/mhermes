@@ -6050,8 +6050,6 @@ class GatewayRunner:
 
     async def _send_voice_reply(self, event: MessageEvent, text: str) -> None:
         """Generate TTS audio and send as a voice message before the text reply."""
-        import uuid as _uuid
-        audio_path = None
         actual_path = None
         try:
             from tools.tts_tool import text_to_speech_tool, _strip_markdown_for_tts
@@ -6060,21 +6058,13 @@ class GatewayRunner:
             if not tts_text:
                 return
 
-            # Use .mp3 extension so edge-tts conversion to opus works correctly.
-            # The TTS tool may convert to .ogg — use file_path from result.
-            audio_path = os.path.join(
-                tempfile.gettempdir(), "hermes_voice",
-                f"tts_reply_{_uuid.uuid4().hex[:12]}.mp3",
-            )
-            os.makedirs(os.path.dirname(audio_path), exist_ok=True)
-
             result_json = await asyncio.to_thread(
-                text_to_speech_tool, text=tts_text, output_path=audio_path
+                text_to_speech_tool, text=tts_text
             )
             result = json.loads(result_json)
 
             # Use the actual file path from result (may differ after opus conversion)
-            actual_path = result.get("file_path", audio_path)
+            actual_path = result.get("file_path")
             if not result.get("success") or not os.path.isfile(actual_path):
                 logger.warning("Auto voice reply TTS failed: %s", result.get("error"))
                 return
@@ -6100,7 +6090,11 @@ class GatewayRunner:
         except Exception as e:
             logger.warning("Auto voice reply failed: %s", e, exc_info=True)
         finally:
-            for p in {audio_path, actual_path} - {None}:
+            cleanup_paths = {actual_path} - {None}
+            if actual_path and str(actual_path).endswith(".ogg"):
+                stem = str(actual_path)[:-4]
+                cleanup_paths.update({f"{stem}.mp3", f"{stem}.wav"})
+            for p in cleanup_paths:
                 try:
                     os.unlink(p)
                 except OSError:
@@ -6124,9 +6118,29 @@ class GatewayRunner:
             media_files, _ = adapter.extract_media(response)
             _, cleaned = adapter.extract_images(response)
             local_files, _ = adapter.extract_local_files(cleaned)
-
+            from tools.send_message_tool import _validate_media_files, _validate_media_path
+            blocked_attachment_errors = []
+            media_error = _validate_media_files(media_files)
+            if media_error:
+                logger.warning("[%s] Post-stream media delivery blocked: %s", adapter.name, media_error)
+                blocked_attachment_errors.append(media_error)
+                media_files = []
+            safe_local_files = []
+            for file_path in local_files:
+                file_error = _validate_media_path(file_path)
+                if file_error:
+                    logger.warning("[%s] Post-stream file delivery blocked: %s", adapter.name, file_error)
+                    blocked_attachment_errors.append(file_error)
+                    continue
+                safe_local_files.append(file_path)
+            local_files = safe_local_files
             _thread_meta = {"thread_id": event.source.thread_id} if event.source.thread_id else None
-
+            if blocked_attachment_errors:
+                await adapter.send(
+                    chat_id=event.source.chat_id,
+                    content="⚠️ Hermes blocked one or more file attachments for safety. Regenerate the artifact in this session before trying to send it again.",
+                    metadata=_thread_meta,
+                )
             _AUDIO_EXTS = {'.ogg', '.opus', '.mp3', '.wav', '.m4a'}
             _VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'}
             _IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
@@ -6282,6 +6296,8 @@ class GatewayRunner:
             return
 
         _thread_metadata = {"thread_id": source.thread_id} if source.thread_id else None
+        from gateway.session_context import clear_session_attachment_scope, restore_attachment_scope, set_attachment_scope
+        attachment_scope_tokens = set_attachment_scope(f"background:{task_id}")
 
         try:
             user_config = _load_gateway_config()
@@ -6350,7 +6366,26 @@ class GatewayRunner:
             if response:
                 media_files, response = adapter.extract_media(response)
                 images, text_content = adapter.extract_images(response)
-
+                local_files, text_content = adapter.extract_local_files(text_content)
+                from tools.send_message_tool import _validate_media_files, _validate_media_path
+                media_error = _validate_media_files(media_files)
+                blocked_attachment_notice = "⚠️ Hermes blocked one or more file attachments for safety. Regenerate the artifact in this session before trying to send it again."
+                blocked_any = False
+                if media_error:
+                    logger.warning("[%s] Background-task media delivery blocked: %s", adapter.name, media_error)
+                    media_files = []
+                    blocked_any = True
+                safe_local_files = []
+                for file_path in local_files:
+                    file_error = _validate_media_path(file_path)
+                    if file_error:
+                        logger.warning("[%s] Background-task local file delivery blocked: %s", adapter.name, file_error)
+                        blocked_any = True
+                        continue
+                    safe_local_files.append(file_path)
+                local_files = safe_local_files
+                if blocked_any:
+                    text_content = f"{text_content}\n\n{blocked_attachment_notice}" if text_content else blocked_attachment_notice
                 preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
                 header = f'✅ Background task complete\nPrompt: "{preview}"\n\n'
 
@@ -6367,6 +6402,8 @@ class GatewayRunner:
                         metadata=_thread_metadata,
                     )
 
+                from pathlib import Path
+
                 # Send extracted images
                 for image_url, alt_text in (images or []):
                     try:
@@ -6374,6 +6411,7 @@ class GatewayRunner:
                             chat_id=source.chat_id,
                             image_url=image_url,
                             caption=alt_text,
+                            metadata=_thread_metadata,
                         )
                     except Exception:
                         pass
@@ -6384,9 +6422,28 @@ class GatewayRunner:
                         await adapter.send_document(
                             chat_id=source.chat_id,
                             file_path=media_path,
+                            metadata=_thread_metadata,
                         )
                     except Exception:
                         pass
+                for file_path in local_files:
+                    try:
+                        ext = Path(file_path).suffix.lower()
+                        if ext in {'.jpg', '.jpeg', '.png', '.webp', '.gif'} and hasattr(adapter, 'send_image_file'):
+                            await adapter.send_image_file(
+                                chat_id=source.chat_id,
+                                image_path=file_path,
+                                metadata=_thread_metadata,
+                            )
+                        else:
+                            await adapter.send_document(
+                                chat_id=source.chat_id,
+                                file_path=file_path,
+                                metadata=_thread_metadata,
+                            )
+                    except Exception:
+                        pass
+
             else:
                 preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
                 await adapter.send(
@@ -6405,6 +6462,9 @@ class GatewayRunner:
                 )
             except Exception:
                 pass
+        finally:
+            clear_session_attachment_scope()
+            restore_attachment_scope(attachment_scope_tokens)
 
     async def _handle_btw_command(self, event: MessageEvent) -> str:
         """Handle /btw <question> — ephemeral side question in the same chat."""
@@ -6455,7 +6515,8 @@ class GatewayRunner:
             return
 
         _thread_meta = {"thread_id": source.thread_id} if source.thread_id else None
-
+        attachment_scope_tokens = None
+        from gateway.session_context import clear_session_attachment_scope, restore_attachment_scope, set_attachment_scope
         try:
             user_config = _load_gateway_config()
             model, runtime_kwargs = self._resolve_session_agent_runtime(
@@ -6470,6 +6531,7 @@ class GatewayRunner:
                     metadata=_thread_meta,
                 )
                 return
+            attachment_scope_tokens = set_attachment_scope(f"btw:{task_id}")
 
             platform_key = _platform_config_key(source.platform)
             reasoning_config = self._load_reasoning_config()
@@ -6535,6 +6597,26 @@ class GatewayRunner:
 
             media_files, response = adapter.extract_media(response)
             images, text_content = adapter.extract_images(response)
+            local_files, text_content = adapter.extract_local_files(text_content)
+            from tools.send_message_tool import _validate_media_files, _validate_media_path
+            media_error = _validate_media_files(media_files)
+            blocked_attachment_notice = "⚠️ Hermes blocked one or more file attachments for safety. Regenerate the artifact in this session before trying to send it again."
+            blocked_any = False
+            if media_error:
+                logger.warning("[%s] /btw media delivery blocked: %s", adapter.name, media_error)
+                media_files = []
+                blocked_any = True
+            safe_local_files = []
+            for file_path in local_files:
+                file_error = _validate_media_path(file_path)
+                if file_error:
+                    logger.warning("[%s] /btw local file delivery blocked: %s", adapter.name, file_error)
+                    blocked_any = True
+                    continue
+                safe_local_files.append(file_path)
+            local_files = safe_local_files
+            if blocked_any:
+                text_content = f"{text_content}\n\n{blocked_attachment_notice}" if text_content else blocked_attachment_notice
             preview = question[:60] + ("..." if len(question) > 60 else "")
             header = f'💬 /btw: "{preview}"\n\n'
 
@@ -6551,17 +6633,46 @@ class GatewayRunner:
                     metadata=_thread_meta,
                 )
 
+            from pathlib import Path
+
             for image_url, alt_text in (images or []):
                 try:
-                    await adapter.send_image(chat_id=source.chat_id, image_url=image_url, caption=alt_text)
+                    await adapter.send_image(
+                        chat_id=source.chat_id,
+                        image_url=image_url,
+                        caption=alt_text,
+                        metadata=_thread_meta,
+                    )
                 except Exception:
                     pass
 
             for media_path, _is_voice in (media_files or []):
                 try:
-                    await adapter.send_file(chat_id=source.chat_id, file_path=media_path)
+                    await adapter.send_file(
+                        chat_id=source.chat_id,
+                        file_path=media_path,
+                        metadata=_thread_meta,
+                    )
                 except Exception:
                     pass
+            for file_path in local_files:
+                try:
+                    ext = Path(file_path).suffix.lower()
+                    if ext in {'.jpg', '.jpeg', '.png', '.webp', '.gif'} and hasattr(adapter, 'send_image_file'):
+                        await adapter.send_image_file(
+                            chat_id=source.chat_id,
+                            image_path=file_path,
+                            metadata=_thread_meta,
+                        )
+                    else:
+                        await adapter.send_file(
+                            chat_id=source.chat_id,
+                            file_path=file_path,
+                            metadata=_thread_meta,
+                        )
+                except Exception:
+                    pass
+
 
         except Exception as e:
             logger.exception("/btw task %s failed", task_id)
@@ -6573,6 +6684,10 @@ class GatewayRunner:
                 )
             except Exception:
                 pass
+        finally:
+            if attachment_scope_tokens is not None:
+                clear_session_attachment_scope()
+                restore_attachment_scope(attachment_scope_tokens)
 
     async def _handle_reasoning_command(self, event: MessageEvent) -> str:
         """Handle /reasoning command — manage reasoning effort and display toggle.
@@ -6964,7 +7079,9 @@ class GatewayRunner:
             try:
                 user_source = source.platform.value if source.platform else None
                 sessions = self._session_db.list_sessions_rich(
-                    source=user_source, limit=10
+                    source=user_source,
+                    limit=10,
+                    user_id=source.user_id,
                 )
                 titled = [s for s in sessions if s.get("title")]
                 if not titled:
@@ -6985,8 +7102,12 @@ class GatewayRunner:
                 logger.debug("Failed to list titled sessions: %s", e)
                 return f"Could not list sessions: {e}"
 
-        # Resolve the name to a session ID
-        target_id = self._session_db.resolve_session_by_title(name)
+        user_source = source.platform.value if source.platform else None
+        target_id = self._session_db.resolve_session_by_title(
+            name,
+            user_id=source.user_id,
+            source=user_source,
+        )
         if not target_id:
             return (
                 f"No session found matching '**{name}**'.\n"
@@ -7062,7 +7183,11 @@ class GatewayRunner:
         else:
             current_title = self._session_db.get_session_title(current_entry.session_id)
             base = current_title or "branch"
-            branch_title = self._session_db.get_next_title_in_lineage(base)
+            branch_title = self._session_db.get_next_title_in_lineage(
+                base,
+                source=source.platform.value if source.platform else "gateway",
+                user_id=source.user_id,
+            )
 
         parent_session_id = current_entry.session_id
 
@@ -7072,6 +7197,7 @@ class GatewayRunner:
                 session_id=new_session_id,
                 source=source.platform.value if source.platform else "gateway",
                 model=(self.config.get("model", {}) or {}).get("default") if isinstance(self.config, dict) else None,
+                user_id=source.user_id,
                 parent_session_id=parent_session_id,
             )
         except Exception as e:
@@ -7932,6 +8058,7 @@ class GatewayRunner:
         in a ``finally`` block.
         """
         from gateway.session_context import set_session_vars
+        import uuid as _uuid
         return set_session_vars(
             platform=context.source.platform.value,
             chat_id=context.source.chat_id,
@@ -7940,10 +8067,12 @@ class GatewayRunner:
             user_id=str(context.source.user_id) if context.source.user_id else "",
             user_name=str(context.source.user_name) if context.source.user_name else "",
             session_key=context.session_key,
+            allowed_attachments=set(),
+            attachment_scope=f"turn:{context.session_key}:{_uuid.uuid4().hex}",
         )
 
     def _clear_session_env(self, tokens: list) -> None:
-        """Restore session context variables to their pre-handler values."""
+        """Clear user-session variables while preserving outer cron/env context."""
         from gateway.session_context import clear_session_vars
         clear_session_vars(tokens)
 
@@ -9352,9 +9481,7 @@ class GatewayRunner:
             # `_resolve_turn_agent_config(message, …)`.
             nonlocal message
 
-            # session_key is now set via contextvars in _set_session_env()
-            # (concurrency-safe). Keep os.environ as fallback for CLI/cron.
-            os.environ["HERMES_SESSION_KEY"] = session_key or ""
+            # session_key is already available via contextvars from _set_session_env().
 
             # Read from env var or use default (same as CLI)
             max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))

@@ -1,0 +1,181 @@
+%% HMAOM System Architecture Overview
+%% Hierarchical Multi-Agent Orchestration Mesh - Full Topology
+
+graph TB
+    subgraph USER_LAYER[" "]
+        USER([👤 User<br/>Any Channel])
+    end
+
+    subgraph GATEWAY["🔷 GATEWAY LAYER (Main Harness)"]
+        direction TB
+        CLASSIFIER["🧠 Intent Classifier<br/>SLM Router (<50ms)<br/>Fallback LLM"]
+        ROUTER["🌐 Gateway Router<br/>SOUL.md<br/>Intent Classifier + Task Router<br/>Route Only — No Domain Logic"]
+    end
+
+    subgraph SPECIALISTS["🔶 SPECIALIST HARNESS LAYER"]
+        direction LR
+
+        subgraph FINANCE["💰 Finance Harness"]
+            F_SKILLS["📚 ~800 Skills"]
+            F_TOOLS["🔧 Domain Tools"]
+            F_MEM["🧠 Memory"]
+            F_SANDBOX["⬡ FUSE Sandbox"]
+            F_AGENT1["⚙️ explore"]
+            F_AGENT2["⚙️ calculate"]
+            F_AGENT3["⚙️ verify"]
+            F_AGENT4["⚙️ backtest"]
+        end
+
+        subgraph MATHS["📐 Maths Harness"]
+            M_SKILLS["📚 ~600 Skills"]
+            M_TOOLS["🔧 Domain Tools"]
+            M_MEM["🧠 Memory"]
+            M_SANDBOX["⬡ FUSE Sandbox"]
+            M_AGENT1["⚙️ explore"]
+            M_AGENT2["⚙️ calculate"]
+            M_AGENT3["⚙️ prove"]
+            M_AGENT4["⚙️ verify"]
+        end
+
+        subgraph PHYSICS["⚛️ Physics Harness"]
+            P_SKILLS["📚 ~500 Skills"]
+            P_TOOLS["🔧 Domain Tools"]
+            P_MEM["🧠 Memory"]
+            P_SANDBOX["⬡ FUSE Sandbox"]
+            P_AGENT1["⚙️ explore"]
+            P_AGENT2["⚙️ simulate"]
+            P_AGENT3["⚙️ calculate"]
+        end
+
+        subgraph CODE["💻 Code Harness"]
+            C_SKILLS["📚 ~1200 Skills"]
+            C_TOOLS["🔧 Domain Tools"]
+            C_MEM["🧠 Memory"]
+            C_SANDBOX["⬡ FUSE Sandbox"]
+            C_AGENT1["⚙️ plan"]
+            C_AGENT2["⚙️ implement"]
+            C_AGENT3["⚙️ review"]
+            C_AGENT4["⚙️ debug"]
+        end
+
+        subgraph RESEARCH["🔍 Research Harness"]
+            R_SKILLS["📚 ~400 Skills"]
+            R_TOOLS["🔧 Domain Tools"]
+            R_MEM["🧠 Memory"]
+            R_SANDBOX["⬡ FUSE Sandbox"]
+            R_AGENT1["⚙️ search"]
+            R_AGENT2["⚙️ extract"]
+            R_AGENT3["⚙️ summarize"]
+        end
+
+        subgraph REPORTER["📄 Reporter Harness"]
+            RP_SKILLS["📚 ~300 Skills"]
+            RP_TOOLS["🔧 Format Tools"]
+            RP_MEM["🧠 Memory"]
+            RP_SANDBOX["⬡ FUSE Sandbox"]
+            RP_AGENT1["⚙️ draft"]
+            RP_AGENT2["⚙️ review"]
+            RP_AGENT3["⚙️ synthesize"]
+            RP_DEBATE["⚙️ debate<br/>(Hermes)"]
+        end
+    end
+
+    subgraph SUBAGENT["🟣 RECURSIVE SUBAGENT LAYER<br/>Max Depth: 3"]
+        direction LR
+        subgraph RECURSION["Level 2→3 Spawn Tree"]
+            SUB1["⚡ Sub-Agent"]
+            SUB2["⚡ Sub-Agent"]
+            LEAF1["🍃 Leaf Agent<br/>NO FURTHER SPAWNING"]
+            LEAF2["🍃 Leaf Agent<br/>NO FURTHER SPAWNING"]
+            SUB1 --> LEAF1
+            SUB2 --> LEAF2
+        end
+    end
+
+    subgraph SYNTHESIS["🟢 SYNTHESIS LAYER"]
+        SYNTH["📝 Reporter Synthesis<br/>Cross-Domain Aggregation<br/>+ Debate Mode"]
+    end
+
+    subgraph OUTPUT["📤 OUTPUT"]
+        OUT([📋 Structured Result<br/>Schema-Validated])
+    end
+
+    subgraph OBSERVABILITY["👁️ OBSERVABILITY"]
+        TRACE["📡 Distributed Tracing<br/>Correlation IDs"]
+        BUDGET["💰 Budget Manager<br/>Tokens / Time / Cost"]
+        CIRCUIT["🔒 Circuit Breakers"]
+        DASHBOARD["📊 Agent Control Center"]
+    end
+
+    subgraph MESSAGEBUS["📬 MESSAGE BUS"]
+        direction TB
+        BUS["Redis / SQLite<br/>JSON Schema Enforced"]
+    end
+
+    USER --> CLASSIFIER
+    CLASSIFIER --> ROUTER
+
+    ROUTER -->|route: single| FINANCE
+    ROUTER -->|route: single| MATHS
+    ROUTER -->|route: single| PHYSICS
+    ROUTER -->|route: single| CODE
+    ROUTER -->|route: parallel| RESEARCH
+    ROUTER -->|route: adaptive| REPORTER
+
+    FINANCE -.->|spawn| SUBAGENT
+    MATHS -.->|spawn| SUBAGENT
+    PHYSICS -.->|spawn| SUBAGENT
+    CODE -.->|spawn| SUBAGENT
+    RESEARCH -.->|spawn| SUBAGENT
+
+    FINANCE -->|result| SYNTH
+    MATHS -->|result| SYNTH
+    PHYSICS -->|result| SYNTH
+    CODE -->|result| SYNTH
+    RESEARCH -->|result| SYNTH
+    REPORTER -->|result| SYNTH
+
+    SYNTH --> OUT
+
+    ROUTER -.->|log| TRACE
+    FINANCE -.->|log| TRACE
+    MATHS -.->|log| TRACE
+    PHYSICS -.->|log| TRACE
+
+    TRACE -.-> DASHBOARD
+    BUDGET -.-> DASHBOARD
+    CIRCUIT -.-> DASHBOARD
+
+    FINANCE -.->|publish| BUS
+    MATHS -.->|publish| BUS
+    PHYSICS -.->|publish| BUS
+    CODE -.->|publish| BUS
+    RESEARCH -.->|publish| BUS
+    REPORTER -.->|consume| BUS
+    SYNTH -.->|consume| BUS
+
+    style USER_LAYER fill:none,stroke:none
+    style USER fill:#e8f5e9,stroke:#2e7d32,stroke-width:3px
+    style GATEWAY fill:#e3f2fd,stroke:#1565c0,stroke-width:2px
+    style CLASSIFIER fill:#bbdefb,stroke:#1565c0
+    style ROUTER fill:#fff3e0,stroke:#e65100,stroke-width:3px
+    style SPECIALISTS fill:#f3e5f5,stroke:#6a1b9a,stroke-width:2px
+    style FINANCE fill:#fce4ec,stroke:#c62828
+    style MATHS fill:#e8eaf6,stroke:#283593
+    style PHYSICS fill:#e0f2f1,stroke:#00695c
+    style CODE fill:#fff8e1,stroke:#f57f17
+    style RESEARCH fill:#f1f8e9,stroke:#558b2f
+    style REPORTER fill:#efebe9,stroke:#4e342e
+    style SUBAGENT fill:#ede7f6,stroke:#4527a0,stroke-width:2px
+    style RECURSION fill:#d1c4e9,stroke:#311b92
+    style SUB1 fill:#b39ddb,stroke:#4527a0
+    style SUB2 fill:#b39ddb,stroke:#4527a0
+    style LEAF1 fill:#a5d6a7,stroke:#2e7d32
+    style LEAF2 fill:#a5d6a7,stroke:#2e7d32
+    style SYNTHESIS fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    style SYNTH fill:#c8e6c9,stroke:#2e7d32
+    style OUTPUT fill:none,stroke:none
+    style OUT fill:#b9f6ca,stroke:#00c853,stroke-width:3px
+    style OBSERVABILITY fill:#eceff1,stroke:#455a64,stroke-width:2px
+    style MESSAGEBUS fill:#fffde7,stroke:#f9a825,stroke-width:2px
+    style BUS fill:#fff9c4,stroke:#f57f17

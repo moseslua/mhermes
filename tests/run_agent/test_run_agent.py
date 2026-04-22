@@ -702,6 +702,23 @@ class TestHydrateTodoStore:
             agent._hydrate_todo_store(history)
         assert not agent._todo_store.has_items()
 
+    def test_attached_mission_skips_history_replay(self, agent):
+        agent._mission_service = MagicMock()
+        agent._mission_service.get_attached_mission_id.return_value = "mission-1"
+        agent._todo_store.bind_session(agent.session_id, agent._mission_service)
+        history = [
+            {
+                "role": "tool",
+                "content": json.dumps({"todos": [{"id": "1", "content": "old local task", "status": "pending"}]}),
+                "tool_call_id": "c1",
+            },
+        ]
+        with patch("run_agent._set_interrupt") as mock_set_interrupt:
+            agent._hydrate_todo_store(history)
+        assert not agent._todo_store.has_items()
+        mock_set_interrupt.assert_called_with(False)
+
+
 
 class TestBuildSystemPrompt:
     def test_always_has_identity(self, agent):
@@ -1602,6 +1619,29 @@ class TestConcurrentToolExecution:
             )
             assert result == "result"
 
+    def test_invoke_tool_uses_session_search_handler(self, agent):
+        agent._session_db = MagicMock()
+        agent._user_id = "user-123"
+        with patch("tools.session_search_tool.session_search", return_value='{"success": true}') as mock_search:
+            result = agent._invoke_tool("session_search", {"query": "hello", "limit": 2}, "task-1")
+
+        mock_search.assert_called_once_with(
+            query="hello",
+            role_filter=None,
+            limit=2,
+            db=agent._session_db,
+            current_session_id=agent.session_id,
+            user_id="user-123",
+            source=None,
+        )
+        assert result == '{"success": true}'
+    def test_safe_base_url_for_signal_redacts_credentials(self, agent):
+        redacted = agent._safe_base_url_for_signal("https://user:secret@example.com/v1?token=abc#frag")
+        assert redacted == "https://example.com/v1"
+
+
+
+
     def test_sequential_tool_callbacks_fire_in_order(self, agent):
         tool_call = _mock_tool_call(name="web_search", arguments='{"query":"hello"}', call_id="c1")
         mock_msg = _mock_assistant_msg(content="", tool_calls=[tool_call])
@@ -1644,6 +1684,91 @@ class TestConcurrentToolExecution:
             result = agent._invoke_tool("todo", {"todos": []}, "task-1")
             mock_todo.assert_called_once()
         assert "ok" in result
+
+    def test_invoke_tool_agent_level_emits_runtime_audit_and_hooks(self, agent, monkeypatch):
+        agent._session_db = MagicMock()
+        pre_tool_calls = []
+        hook_calls = []
+
+        def _record_block(tool_name, args, task_id="", session_id="", tool_call_id=""):
+            pre_tool_calls.append({
+                "tool_name": tool_name,
+                "args": args,
+                "task_id": task_id,
+                "session_id": session_id,
+                "tool_call_id": tool_call_id,
+            })
+            return None
+
+        def _record_hook(name, **kwargs):
+            hook_calls.append((name, kwargs))
+            return []
+
+        monkeypatch.setattr("hermes_cli.plugins.get_pre_tool_call_block_message", _record_block)
+        monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _record_hook)
+
+        with patch("tools.todo_tool.todo_tool", return_value='{"ok":true}') as mock_todo:
+            result = agent._invoke_tool("todo", {"todos": []}, "task-1", tool_call_id="c1")
+
+        assert result == '{"ok":true}'
+        mock_todo.assert_called_once()
+        assert pre_tool_calls == [{
+            "tool_name": "todo",
+            "args": {"todos": []},
+            "task_id": "task-1",
+            "session_id": agent.session_id,
+            "tool_call_id": "c1",
+        }]
+        assert hook_calls == [(
+            "post_tool_call",
+            {
+                "tool_name": "todo",
+                "args": {"todos": []},
+                "result": '{"ok":true}',
+                "task_id": "task-1",
+                "session_id": agent.session_id,
+                "tool_call_id": "c1",
+            },
+        )]
+        phases = [call.args[0].phase for call in agent._session_db.append_runtime_signal_audit.call_args_list]
+        event_types = [call.args[0].event_type for call in agent._session_db.append_runtime_signal_audit.call_args_list]
+        assert event_types == ["tool.call", "tool.call"]
+        assert phases == ["requested", "completed"]
+        assert "arguments" not in agent._session_db.append_runtime_signal_audit.call_args_list[0].args[0].payload
+
+
+
+    def test_invoke_tool_blocked_emits_runtime_audit_and_post_hook(self, agent, monkeypatch):
+        agent._session_db = MagicMock()
+        hook_calls = []
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_pre_tool_call_block_message",
+            lambda *args, **kwargs: "Blocked by test policy",
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda name, **kwargs: hook_calls.append((name, kwargs)) or [],
+        )
+
+        with patch("tools.todo_tool.todo_tool", side_effect=AssertionError("should not run")) as mock_todo:
+            result = agent._invoke_tool("todo", {"todos": []}, "task-1", tool_call_id="c1")
+
+        assert json.loads(result) == {"error": "Blocked by test policy"}
+        mock_todo.assert_not_called()
+        assert hook_calls == [(
+            "post_tool_call",
+            {
+                "tool_name": "todo",
+                "args": {"todos": []},
+                "result": '{"error": "Blocked by test policy"}',
+                "task_id": "task-1",
+                "session_id": agent.session_id,
+                "tool_call_id": "c1",
+            },
+        )]
+        phases = [call.args[0].phase for call in agent._session_db.append_runtime_signal_audit.call_args_list]
+        assert phases == ["requested", "blocked"]
 
     def test_invoke_tool_blocked_returns_error_and_skips_execution(self, agent, monkeypatch):
         """_invoke_tool should return error JSON when a plugin blocks the tool."""
@@ -1891,6 +2016,119 @@ class TestRunConversation:
         assert all(call["session_id"] == agent.session_id for call in pre_request_calls)
         assert all("message_count" in c and "messages" not in c for c in pre_request_calls)
         assert all("usage" in c and "response" not in c for c in post_request_calls)
+
+    def test_run_conversation_emits_runtime_signals_for_session_llm_and_api(self, agent):
+        self._setup_agent(agent)
+        agent._cached_system_prompt = None
+        agent._session_db = MagicMock()
+        agent._session_db.get_session.return_value = None
+        resp = _mock_response(content="Final answer", finish_reason="stop")
+        agent.client.chat.completions.create.return_value = resp
+
+        hook_calls = []
+
+        def _record_hook(name, **kwargs):
+            hook_calls.append((name, kwargs))
+            if name == "pre_llm_call":
+                return [{"context": "plugin memo"}]
+            return []
+
+        with (
+            patch("hermes_cli.plugins.invoke_hook", side_effect=_record_hook),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["final_response"] == "Final answer"
+        assert result["messages"][0]["content"] == "hello"
+        observed_hook_names = [name for name, _ in hook_calls]
+        assert observed_hook_names[:5] == [
+            "on_session_start",
+            "pre_llm_call",
+            "pre_api_request",
+            "post_api_request",
+            "post_llm_call",
+        ]
+        persisted_signals = [call.args[0] for call in agent._session_db.append_runtime_signal_audit.call_args_list]
+        assert [(signal.event_type, signal.phase) for signal in persisted_signals] == [
+            ("session.lifecycle", "started"),
+            ("llm.call", "requested"),
+            ("api.request", "requested"),
+            ("api.request", "completed"),
+            ("llm.call", "completed"),
+        ]
+        assert persisted_signals[1].payload["user_message_chars"] == len("hello")
+        assert persisted_signals[1].payload["history_length"] == 1
+
+    def test_run_conversation_emits_mission_id_on_session_start(self, agent):
+        self._setup_agent(agent)
+        agent._cached_system_prompt = None
+        agent._session_db = MagicMock()
+        agent._session_db.get_session.return_value = None
+        agent._mission_service = MagicMock()
+        agent._mission_service.get_attached_mission_id.return_value = "mission-1"
+        resp = _mock_response(content="Final answer", finish_reason="stop")
+        agent.client.chat.completions.create.return_value = resp
+
+        with (
+            patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            agent.run_conversation("hello")
+
+        persisted_signals = [call.args[0] for call in agent._session_db.append_runtime_signal_audit.call_args_list]
+        assert persisted_signals[0].event_type == "session.lifecycle"
+        assert persisted_signals[0].phase == "started"
+        assert persisted_signals[0].mission_id == "mission-1"
+
+
+    def test_run_conversation_emits_failed_runtime_signals_for_non_retryable_api_error(self, agent):
+        self._setup_agent(agent)
+        agent._cached_system_prompt = None
+        agent._session_db = MagicMock()
+        agent._session_db.get_session.return_value = None
+        agent.client.chat.completions.create.side_effect = ValueError("bad request")
+        with (
+            patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+        assert result["failed"] is True
+        persisted_signals = [call.args[0] for call in agent._session_db.append_runtime_signal_audit.call_args_list]
+        assert [(signal.event_type, signal.phase) for signal in persisted_signals] == [
+            ("session.lifecycle", "started"),
+            ("llm.call", "requested"),
+            ("api.request", "requested"),
+            ("api.request", "failed"),
+            ("llm.call", "failed"),
+        ]
+        assert persisted_signals[-1].payload["error_class"] == "ValueError"
+        assert persisted_signals[-1].payload["error_message_chars"] == len("bad request")
+
+    def test_run_conversation_ignores_runtime_signal_audit_failures(self, agent):
+        self._setup_agent(agent)
+        agent._session_db = MagicMock()
+        agent._session_db.get_session.return_value = None
+        agent._session_db.append_runtime_signal_audit.side_effect = RuntimeError("audit down")
+        resp = _mock_response(content="Final answer", finish_reason="stop")
+        agent.client.chat.completions.create.return_value = resp
+
+        with (
+            patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["final_response"] == "Final answer"
+        assert result["messages"][0]["content"] == "hello"
 
     def test_content_with_tool_calls_stays_silent_for_non_cli_quiet_mode(self, agent):
         self._setup_agent(agent)

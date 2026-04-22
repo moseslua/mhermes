@@ -103,9 +103,8 @@ your task, load it with skill_view(name) and follow its instructions.
 The following project context files have been loaded and should be followed:
 
 ## AGENTS.md
-This is the atlas project. Use pytest for testing. The main
-entry point is src/atlas/main.py. Always run `make lint` before
-committing.
+This is the atlas project. Keep contributor workflow guidance in docs/skills,
+and keep the runtime prompt focused on architecture and task context rather than evolving process policy.
 
 # Layer 9: Timestamp + session
 Current time: 2026-03-30T14:30:00-07:00
@@ -229,6 +228,17 @@ Long files are truncated before injection.
 ## Skills index
 
 The skills system contributes a compact skills index to the prompt when skills tooling is available.
+
+## Where contributor workflow policy should live
+
+Hermes keeps stable cached prompt layers deliberately small and durable. As a rule, contributor-process policy — PR checklists, AI-first review rules, plan contract templates, and eval-selection guidance — should prefer to live in docs, templates, and on-demand skills rather than the stable cached prefix.
+
+That means:
+- put evolving workflow guidance in `CONTRIBUTING.md`, the PR template, and skill files
+- use ephemeral overlays or explicit skill invocation when runtime guidance is needed for a specific task
+- if project context files such as `AGENTS.md` include workflow rules, keep them stable, high-signal, and consistent with the canonical docs instead of letting them drift independently
+
+This preserves provider-side prompt caching and keeps delegated/subagent behavior more predictable across sessions.
 
 ## Why prompt assembly is split this way
 

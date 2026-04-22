@@ -7,6 +7,8 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
+from gateway.session_context import restore_session_vars, set_session_vars
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 
@@ -192,6 +194,39 @@ class TestBrowserVisionAnnotate:
                 args = mock_cmd.call_args[0]
                 cmd_args = args[2] if len(args) > 2 else []
                 assert "--annotate" in cmd_args
+
+
+class TestBrowserNavigatePrivateGuard:
+    def test_cron_session_blocks_private_url_on_local_backend(self):
+        from tools.browser_tool import browser_navigate
+
+        tokens = set_session_vars(cron_session="1")
+        try:
+            with (
+                patch("tools.browser_tool._is_local_backend", return_value=True),
+                patch("tools.browser_tool._allow_private_urls", return_value=False),
+                patch("tools.browser_tool._is_safe_url", return_value=False),
+            ):
+                result = json.loads(browser_navigate("http://127.0.0.1:8123", task_id="test"))
+        finally:
+            restore_session_vars(tokens)
+
+        assert result["success"] is False
+        assert "Browser automation is disabled" in result["error"]
+
+    def test_expression_mode_disabled_in_gateway_session(self):
+        from tools.browser_tool import browser_console
+
+        tokens = set_session_vars(platform="telegram", chat_id="123")
+        try:
+            with patch("tools.browser_tool._is_local_backend", return_value=True):
+                result = json.loads(browser_console(expression="window.location.href", task_id="test"))
+        finally:
+            restore_session_vars(tokens)
+
+        assert result["success"] is False
+        assert "Browser automation is disabled" in result["error"]
+
 
 
 # ── auto-recording config ────────────────────────────────────────────

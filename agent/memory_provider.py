@@ -220,12 +220,22 @@ class MemoryProvider(ABC):
           should all have ``env_var`` set and this method stays no-op).
         """
 
-    def on_memory_write(self, action: str, target: str, content: str) -> None:
+    def on_memory_write(
+        self,
+        action: str,
+        target: str,
+        content: str,
+        *,
+        old_text: str | None = None,
+        current_state: list[str] | None = None,
+    ) -> None:
         """Called when the built-in memory tool writes an entry.
 
         action: 'add', 'replace', or 'remove'
         target: 'memory' or 'user'
-        content: the entry content
-
+        content: the new entry content (empty for remove)
+        old_text: the replaced/removed match key when applicable
+        current_state: canonical post-write entries for the target, if available
+        
         Use to mirror built-in memory writes to your backend.
         """

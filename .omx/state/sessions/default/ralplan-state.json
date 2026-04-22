@@ -1,0 +1,10 @@
+{
+  "active": false,
+  "iteration": 5,
+  "max_iterations": 5,
+  "current_phase": "completed",
+  "task_description": "Create a full-scale consensus plan markdown artifact for integrating all requested features from hermes-agent-camel, hermes-alpha, hermes-skill-factory, maestro, and icarus-plugin into Hermes.",
+  "started_at": "2026-04-20T09:27:17Z",
+  "completed_at": "2026-04-20T10:06:00Z",
+  "error": ""
+}

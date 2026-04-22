@@ -1,9 +1,18 @@
 """Tests for hermes_state.py — SessionDB SQLite CRUD, FTS5 search, export."""
 
+import sqlite3
 import time
-import pytest
 from pathlib import Path
 
+import pytest
+
+from agent.runtime_signals import (
+    MAX_RUNTIME_SIGNAL_PAYLOAD_BYTES,
+    RuntimeSignalRef,
+    completed_signal,
+    requested_signal,
+    started_signal,
+ )
 from hermes_state import SessionDB
 
 
@@ -1065,12 +1074,13 @@ class TestSchemaInit:
         tables = {row[0] for row in cursor.fetchall()}
         assert "sessions" in tables
         assert "messages" in tables
+        assert "runtime_signal_audit" in tables
         assert "schema_version" in tables
 
     def test_schema_version(self, db):
         cursor = db._conn.execute("SELECT version FROM schema_version")
         version = cursor.fetchone()[0]
-        assert version == 6
+        assert version == 8
 
     def test_title_column_exists(self, db):
         """Verify the title column was created in the sessions table."""
@@ -1126,12 +1136,18 @@ class TestSchemaInit:
         conn.commit()
         conn.close()
 
-        # Open with SessionDB — should migrate to v6
+        # Open with SessionDB — should migrate to v8
         migrated_db = SessionDB(db_path=db_path)
 
         # Verify migration
         cursor = migrated_db._conn.execute("SELECT version FROM schema_version")
-        assert cursor.fetchone()[0] == 6
+        assert cursor.fetchone()[0] == 8
+
+        cursor = migrated_db._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='runtime_signal_audit'"
+        )
+        assert cursor.fetchone() is not None
+
 
         # Verify title column exists and is NULL for existing sessions
         session = migrated_db.get_session("existing")
@@ -1144,6 +1160,162 @@ class TestSchemaInit:
         assert session["title"] == "Migrated Title"
 
         migrated_db.close()
+
+class TestRuntimeSignalAudit:
+    def test_append_and_list_runtime_signal_rows(self, db):
+        db.create_session("s1", "cli")
+        requested = requested_signal(
+            event_type="tool.call",
+            publisher="run_agent._emit_runtime_signal",
+            session_id="s1",
+            correlation_id="corr-1",
+            sequence_no=1,
+            actor=RuntimeSignalRef(kind="assistant", id="agent"),
+            subject=RuntimeSignalRef(kind="tool", id="web_search"),
+            provenance="trusted",
+            payload={"arguments": {"query": "Hermes"}},
+            idempotency_key="tool.call:s1:1",
+        )
+        completed = completed_signal(
+            event_type="tool.call",
+            publisher="run_agent._emit_runtime_signal",
+            session_id="s1",
+            correlation_id="corr-1",
+            sequence_no=2,
+            actor={"kind": "assistant", "id": "agent"},
+            subject={"kind": "tool", "id": "web_search"},
+            provenance="trusted",
+            payload={"ok": True, "results": 3},
+            idempotency_key="tool.call:s1:2",
+        )
+
+        first_id = db.append_runtime_signal_audit(requested)
+        second_id = db.append_runtime_signal_audit(completed)
+
+        first_row = db.get_runtime_signal_audit(first_id)
+        assert first_row is not None
+        assert first_row["event_type"] == "tool.call"
+        assert first_row["phase"] == "requested"
+        assert first_row["actor"] == {"kind": "assistant", "id": "agent"}
+        assert first_row["subject"] == {"kind": "tool", "id": "web_search"}
+        assert first_row["payload"] == {"arguments": {"query": "Hermes"}}
+
+        rows = db.list_runtime_signal_audit(session_id="s1", after_audit_id=first_id)
+        assert [row["audit_id"] for row in rows] == [second_id]
+        assert rows[0]["phase"] == "completed"
+        assert rows[0]["correlation_id"] == "corr-1"
+        assert rows[0]["sequence_no"] == 2
+
+    def test_runtime_signal_payload_is_json_safe_and_bounded(self, db):
+        db.create_session("s1", "cli")
+        signal = started_signal(
+            event_type="llm.call",
+            publisher="run_agent._emit_runtime_signal",
+            session_id="s1",
+            correlation_id="corr-2",
+            sequence_no=3,
+            actor={"kind": "assistant", "id": "agent"},
+            subject={"kind": "model", "id": "claude-opus"},
+            provenance="derived",
+            payload={
+                "blob": "x" * (MAX_RUNTIME_SIGNAL_PAYLOAD_BYTES * 2),
+                "binary": b"\xff\x00",
+                "set_values": {1, 2, 3},
+            },
+            idempotency_key="llm.call:s1:3",
+        )
+
+        audit_id = db.append_runtime_signal_audit(signal)
+        stored = db.get_runtime_signal_audit(audit_id)
+
+        assert stored is not None
+        assert stored["payload_bytes"] <= MAX_RUNTIME_SIGNAL_PAYLOAD_BYTES
+        assert stored["payload"]["binary"].startswith("<bytes:2:")
+        assert set(stored["payload"]["set_values"]) == {1, 2, 3}
+        assert len(stored["payload"]["blob"]) <= 2_049
+
+    def test_runtime_signal_payload_uses_preview_envelope_when_budget_exceeded(self, db):
+        db.create_session("s1", "cli")
+        signal = started_signal(
+            event_type="llm.call",
+            publisher="run_agent._emit_runtime_signal",
+            session_id="s1",
+            correlation_id="corr-2b",
+            sequence_no=4,
+            actor={"kind": "assistant", "id": "agent"},
+            subject={"kind": "model", "id": "claude-opus"},
+            provenance="derived",
+            payload={"entries": [f"{idx}-" + ("x" * 2_000) for idx in range(8)]},
+            idempotency_key="llm.call:s1:4",
+        )
+
+        audit_id = db.append_runtime_signal_audit(signal)
+        stored = db.get_runtime_signal_audit(audit_id)
+
+        assert stored is not None
+        assert stored["payload_bytes"] <= MAX_RUNTIME_SIGNAL_PAYLOAD_BYTES
+        assert stored["payload"]["_truncated"] is True
+        assert stored["payload"]["original_bytes"] > MAX_RUNTIME_SIGNAL_PAYLOAD_BYTES
+        assert "preview" in stored["payload"]
+
+    def test_duplicate_event_id_reuses_existing_audit_row(self, db):
+        db.create_session("s1", "cli")
+        signal = requested_signal(
+            event_type="session.started",
+            publisher="run_agent._emit_runtime_signal",
+            session_id="s1",
+            correlation_id="corr-3",
+            sequence_no=1,
+            actor={"kind": "system", "id": "scheduler"},
+            subject={"kind": "session", "id": "s1"},
+            provenance="system",
+            payload={"source": "cli"},
+            event_id="evt-fixed",
+            idempotency_key="session.started:s1",
+        )
+
+        first_id = db.append_runtime_signal_audit(signal)
+        second_id = db.append_runtime_signal_audit(signal.to_dict())
+
+        assert second_id == first_id
+        rows = db.list_runtime_signal_audit(session_id="s1")
+        assert [row["event_id"] for row in rows] == ["evt-fixed"]
+
+    def test_same_idempotency_key_with_new_event_id_persists_replay_row(self, db):
+        signal_one = requested_signal(
+            event_type="session.started",
+            publisher="run_agent._emit_runtime_signal",
+            session_id=None,
+            correlation_id="corr-4",
+            actor={"kind": "system", "id": "scheduler"},
+            subject={"kind": "session", "id": "missing-session"},
+            provenance="system",
+            payload={"source": "cli"},
+            event_id="evt-replay-1",
+            idempotency_key="session.started:missing-session",
+        )
+        signal_two = requested_signal(
+            event_type="session.started",
+            publisher="run_agent._emit_runtime_signal",
+            session_id="missing-session",
+            correlation_id="corr-4",
+            actor={"kind": "system", "id": "scheduler"},
+            subject={"kind": "session", "id": "missing-session"},
+            provenance="system",
+            payload={"source": "cli", "retry": True},
+            event_id="evt-replay-2",
+            idempotency_key="session.started:missing-session",
+        )
+
+        first_id = db.append_runtime_signal_audit(signal_one)
+        second_id = db.append_runtime_signal_audit(signal_two)
+
+        assert second_id != first_id
+        rows = db.list_runtime_signal_audit(correlation_id="corr-4")
+        assert [row["event_id"] for row in rows] == ["evt-replay-1", "evt-replay-2"]
+        assert rows[0]["session_id"] is None
+        assert rows[1]["session_id"] == "missing-session"
+
 
 
 class TestTitleUniqueness:
@@ -1214,6 +1386,49 @@ class TestTitleLineage:
         # Resolving "my project" should return s3 (latest numbered variant)
         assert db.resolve_session_by_title("my project") == "s3"
 
+    def test_delete_session_removes_runtime_signal_audit(self, db):
+        from agent.runtime_signals import requested_signal
+        db.create_session(session_id="s1", source="cli")
+        db.append_runtime_signal_audit(
+            requested_signal(
+                event_type="tool.call",
+                publisher="test",
+                session_id="s1",
+                correlation_id="s1:tool:x",
+                payload={"tool": "x"},
+                idempotency_key="signal-1",
+            )
+        )
+        assert db.list_runtime_signal_audit(session_id="s1")
+        assert db.delete_session("s1") is True
+        assert db.list_runtime_signal_audit(session_id="s1") == []
+
+    def test_prune_sessions_removes_runtime_signal_audit(self, db):
+        from agent.runtime_signals import requested_signal
+        old_started = time.time() - (120 * 86400)
+        db.create_session(session_id="old", source="cli")
+        db.end_session("old", end_reason="done")
+        db._execute_write(
+            lambda conn: conn.execute(
+                "UPDATE sessions SET started_at = ?, ended_at = ? WHERE id = ?",
+                (old_started, old_started, "old"),
+            )
+        )
+        db.append_runtime_signal_audit(
+            requested_signal(
+                event_type="session.lifecycle",
+                publisher="test",
+                session_id="old",
+                correlation_id="old:session",
+                payload={"status": "done"},
+                idempotency_key="signal-old",
+            )
+        )
+        assert db.list_runtime_signal_audit(session_id="old")
+        assert db.prune_sessions(older_than_days=90) == 1
+        assert db.list_runtime_signal_audit(session_id="old") == []
+
+
     def test_resolve_exact_numbered(self, db):
         """Resolving an exact numbered title returns that specific session."""
         db.create_session("s1", "cli")
@@ -1254,6 +1469,22 @@ class TestTitleLineage:
         db.set_session_title("s2", "my project #2")
         # Even when called with "my project #2", it should return #3
         assert db.get_next_title_in_lineage("my project #2") == "my project #3"
+
+    def test_next_title_scoped_by_user_and_source(self, db):
+        db.create_session("alice-1", "telegram", user_id="alice")
+        db.set_session_title("alice-1", "incident review")
+        db.create_session("bob-1", "telegram", user_id="bob")
+        db.set_session_title("bob-1", "incident review #2")
+
+        assert (
+            db.get_next_title_in_lineage(
+                "incident review",
+                source="telegram",
+                user_id="alice",
+            )
+            == "incident review #2"
+        )
+
 
 
 class TestTitleSqlWildcards:
@@ -1449,6 +1680,18 @@ class TestResolveSessionByNameOrId:
         assert result == "s1"
 
 
+class TestUserScopedSearchMessages:
+    def test_cjk_like_fallback_respects_user_id(self, db):
+        db.create_session("s1", "telegram", user_id="u1")
+        db.create_session("s2", "telegram", user_id="u2")
+        db.append_message("s1", "user", "秘密のメモ")
+        db.append_message("s2", "user", "秘密のメモ")
+
+        results = db.search_messages("秘密", user_id="u1")
+
+        assert {row["session_id"] for row in results} == {"s1"}
+
+
 # =========================================================================
 # Concurrent write safety / lock contention fixes (#3139)
 # =========================================================================
@@ -1510,3 +1753,124 @@ class TestConcurrentWriteSafety:
         assert "30" in src, (
             "SQLite timeout should be at least 30s to handle CLI/gateway lock contention"
         )
+
+
+
+class TestMissionSchemaMigration:
+    def test_upgrades_v7_database_with_existing_session_rows(self, tmp_path):
+        db_path = tmp_path / "legacy_state.db"
+        conn = sqlite3.connect(db_path)
+        conn.executescript(
+            """
+            CREATE TABLE schema_version (version INTEGER NOT NULL);
+            INSERT INTO schema_version (version) VALUES (7);
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                user_id TEXT,
+                model TEXT,
+                model_config TEXT,
+                system_prompt TEXT,
+                parent_session_id TEXT,
+                started_at REAL NOT NULL,
+                ended_at REAL,
+                end_reason TEXT,
+                message_count INTEGER DEFAULT 0,
+                tool_call_count INTEGER DEFAULT 0,
+                input_tokens INTEGER DEFAULT 0,
+                output_tokens INTEGER DEFAULT 0,
+                cache_read_tokens INTEGER DEFAULT 0,
+                cache_write_tokens INTEGER DEFAULT 0,
+                reasoning_tokens INTEGER DEFAULT 0,
+                billing_provider TEXT,
+                billing_base_url TEXT,
+                billing_mode TEXT,
+                estimated_cost_usd REAL,
+                actual_cost_usd REAL,
+                cost_status TEXT,
+                cost_source TEXT,
+                pricing_version TEXT,
+                title TEXT
+            );
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT,
+                tool_call_id TEXT,
+                tool_calls TEXT,
+                tool_name TEXT,
+                timestamp REAL NOT NULL,
+                token_count INTEGER,
+                finish_reason TEXT,
+                reasoning TEXT,
+                reasoning_details TEXT,
+                codex_reasoning_items TEXT
+            );
+            CREATE TABLE runtime_signal_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT NOT NULL UNIQUE,
+                idempotency_key TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                phase TEXT NOT NULL,
+                occurred_at REAL NOT NULL,
+                publisher TEXT NOT NULL,
+                session_id TEXT,
+                mission_id TEXT,
+                correlation_id TEXT NOT NULL,
+                sequence_no INTEGER,
+                actor_json TEXT,
+                subject_json TEXT,
+                provenance TEXT NOT NULL,
+                payload_json TEXT,
+                payload_bytes INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL
+            );
+            INSERT INTO sessions (id, source, started_at, title) VALUES ('legacy', 'cli', 123.0, 'Legacy');
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        session_db = SessionDB(db_path=db_path)
+        try:
+            session = session_db.get_session("legacy")
+            assert session is not None
+            assert session["title"] == "Legacy"
+
+            columns = {
+                row["name"]
+                for row in session_db._conn.execute("PRAGMA table_info(sessions)").fetchall()
+            }
+            assert "attached_mission_id" in columns
+            assert "local_todo_state" in columns
+
+            tables = {
+                row["name"]
+                for row in session_db._conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
+            assert {"missions", "mission_nodes", "mission_links", "handoff_packets", "mission_checkpoints"} <= tables
+        finally:
+            session_db.close()
+
+
+class TestMissionSessionCleanup:
+    def test_delete_session_repairs_last_active_mission(self, tmp_path):
+        db_path = tmp_path / "mission_cleanup.db"
+        session_db = SessionDB(db_path=db_path)
+        try:
+            from agent.mission_state import MissionService
+
+            service = MissionService(session_db)
+            session_db.create_session(session_id="s1", source="cli")
+            mission = service.create_mission(title="Cleanup")
+            service.approve_mission(mission["id"])
+            service.attach_session("s1", mission["id"])
+
+            assert service.get_mission(mission["id"])["status"] == "active"
+            assert session_db.delete_session("s1") is True
+            assert service.get_mission(mission["id"])["status"] == "approved"
+        finally:
+            session_db.close()

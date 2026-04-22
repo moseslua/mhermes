@@ -1560,13 +1560,13 @@ def _looks_like_slash_command(text: str) -> bool:
 # ============================================================================
 
 from agent.skill_commands import (
-    scan_skill_commands,
+    get_skill_commands,
     build_skill_invocation_message,
     build_plan_path,
     build_preloaded_skills_prompt,
-)
+ )
 
-_skill_commands = scan_skill_commands()
+_skill_commands = get_skill_commands()
 
 
 def _get_plugin_cmd_handler_names() -> set:
@@ -4298,7 +4298,11 @@ class HermesCLI:
             if hasattr(self.agent, "_todo_store"):
                 try:
                     from tools.todo_tool import TodoStore
-                    self.agent._todo_store = TodoStore()
+                    mission_service = getattr(self.agent, "_mission_service", None)
+                    if hasattr(self.agent._todo_store, "bind_session"):
+                        self.agent._todo_store.bind_session(self.agent.session_id, mission_service)
+                    else:
+                        self.agent._todo_store = TodoStore(session_id=self.agent.session_id, mission_service=mission_service)
                 except Exception:
                     pass
             if hasattr(self.agent, "_invalidate_system_prompt"):
@@ -4384,7 +4388,11 @@ class HermesCLI:
             if hasattr(self.agent, "_todo_store"):
                 try:
                     from tools.todo_tool import TodoStore
-                    self.agent._todo_store = TodoStore()
+                    mission_service = getattr(self.agent, "_mission_service", None)
+                    if hasattr(self.agent._todo_store, "bind_session"):
+                        self.agent._todo_store.bind_session(self.agent.session_id, mission_service)
+                    else:
+                        self.agent._todo_store = TodoStore(session_id=self.agent.session_id, mission_service=mission_service)
                 except Exception:
                     pass
             if hasattr(self.agent, "_invalidate_system_prompt"):
@@ -4461,6 +4469,9 @@ class HermesCLI:
             _cprint(f"  Failed to create branch session: {e}")
             return
 
+        if getattr(self.agent, "_mission_service", None):
+            self.agent._mission_service.clone_session_work_context(parent_session_id, new_session_id)
+
         # Copy conversation history to the new session
         for msg in self.conversation_history:
             try:
@@ -4498,7 +4509,11 @@ class HermesCLI:
             if hasattr(self.agent, "_todo_store"):
                 try:
                     from tools.todo_tool import TodoStore
-                    self.agent._todo_store = TodoStore()
+                    mission_service = getattr(self.agent, "_mission_service", None)
+                    if hasattr(self.agent._todo_store, "bind_session"):
+                        self.agent._todo_store.bind_session(self.agent.session_id, mission_service)
+                    else:
+                        self.agent._todo_store = TodoStore(session_id=self.agent.session_id, mission_service=mission_service)
                 except Exception:
                     pass
             if hasattr(self.agent, "_invalidate_system_prompt"):

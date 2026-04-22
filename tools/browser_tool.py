@@ -210,6 +210,17 @@ def _get_extraction_model() -> Optional[str]:
     return os.getenv("AUXILIARY_WEB_EXTRACT_MODEL", "").strip() or None
 
 
+def _redact_cdp_url_for_log(cdp_url: str) -> str:
+    from urllib.parse import urlsplit, urlunsplit
+
+    parts = urlsplit(cdp_url)
+    netloc = parts.hostname or ""
+    if parts.port:
+        netloc = f"{netloc}:{parts.port}"
+    sanitized = parts._replace(netloc=netloc, query="", fragment="")
+    return urlunsplit(sanitized)
+
+
 def _resolve_cdp_override(cdp_url: str) -> str:
     """Normalize a user-supplied CDP endpoint into a concrete connectable URL.
 
@@ -247,15 +258,27 @@ def _resolve_cdp_override(cdp_url: str) -> str:
         response.raise_for_status()
         payload = response.json()
     except Exception as exc:
-        logger.warning("Failed to resolve CDP endpoint %s via %s: %s", raw, version_url, exc)
+        logger.warning(
+            "Failed to resolve CDP endpoint %s via %s: %s",
+            _redact_cdp_url_for_log(raw),
+            _redact_cdp_url_for_log(version_url),
+            exc,
+        )
         return raw
 
     ws_url = str(payload.get("webSocketDebuggerUrl") or "").strip()
     if ws_url:
-        logger.info("Resolved CDP endpoint %s -> %s", raw, ws_url)
+        logger.info(
+            "Resolved CDP endpoint %s -> %s",
+            _redact_cdp_url_for_log(raw),
+            _redact_cdp_url_for_log(ws_url),
+        )
         return ws_url
 
-    logger.warning("CDP discovery at %s did not return webSocketDebuggerUrl; using raw endpoint", version_url)
+    logger.warning(
+        "CDP discovery at %s did not return webSocketDebuggerUrl; using raw endpoint",
+        _redact_cdp_url_for_log(version_url),
+    )
     return raw
 
 
@@ -408,6 +431,69 @@ def _allow_private_urls() -> bool:
     except Exception as e:
         logger.debug("Could not read allow_private_urls from config: %s", e)
     return _cached_allow_private_urls
+
+def _should_enforce_private_url_guard() -> bool:
+    from gateway.session_context import get_session_env
+    session_platform = get_session_env("HERMES_SESSION_PLATFORM", "").strip().lower()
+    cron_session = get_session_env("HERMES_CRON_SESSION", "") == "1"
+    return cron_session or session_platform not in {"", "cli", "tui", "local"}
+
+def _guard_browser_access() -> Optional[str]:
+    if _should_enforce_private_url_guard():
+        return json.dumps({
+            "success": False,
+            "error": "Browser automation is disabled in guarded non-local sessions.",
+        }, ensure_ascii=False)
+    return None
+
+
+
+def _navigate_browser_to_blank(task_id: str) -> None:
+    if _is_camofox_mode():
+        from tools.browser_camofox import camofox_navigate
+        camofox_navigate("about:blank", task_id)
+        return
+    _run_browser_command(task_id, "open", ["about:blank"], timeout=10)
+
+
+def _get_current_browser_url(task_id: str) -> tuple[Optional[str], Optional[str]]:
+    expression = "window.location.href"
+    if _is_camofox_mode():
+        raw = json.loads(_camofox_eval(expression, task_id))
+        if not raw.get("success"):
+            return None, raw.get("error", "eval failed")
+        return str(raw.get("result") or ""), None
+    result = _run_browser_command(task_id, "eval", [expression])
+    if not result.get("success"):
+        return None, result.get("error", "eval failed")
+    return str(result.get("data", {}).get("result") or ""), None
+
+
+def _guard_current_page_url(task_id: Optional[str]) -> Optional[str]:
+    effective_task_id = task_id or "default"
+    if not _should_enforce_private_url_guard() or _allow_private_urls():
+        return None
+    current_url, error = _get_current_browser_url(effective_task_id)
+    if error:
+        return json.dumps({
+            "success": False,
+            "error": f"Blocked: could not verify current page URL ({error})",
+        }, ensure_ascii=False)
+    if current_url and not _is_safe_url(current_url):
+        _navigate_browser_to_blank(effective_task_id)
+        return json.dumps({
+            "success": False,
+            "error": "Blocked: current page URL targets a private or internal address",
+        }, ensure_ascii=False)
+    blocked = check_website_access(current_url) if current_url else None
+    if blocked:
+        _navigate_browser_to_blank(effective_task_id)
+        return json.dumps({
+            "success": False,
+            "error": blocked["message"],
+            "blocked_by_policy": {"host": blocked["host"], "rule": blocked["rule"], "source": blocked["source"]},
+        }, ensure_ascii=False)
+    return None
 
 
 def _socket_safe_tmpdir() -> str:
@@ -907,7 +993,7 @@ def _create_cdp_session(task_id: str, cdp_url: str) -> Dict[str, str]:
     import uuid
     session_name = f"cdp_{uuid.uuid4().hex[:10]}"
     logger.info("Created CDP browser session %s → %s for task %s",
-                session_name, cdp_url, task_id)
+                session_name, _redact_cdp_url_for_log(cdp_url), task_id)
     return {
         "session_name": session_name,
         "bb_session_id": None,
@@ -1394,6 +1480,10 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
     Returns:
         JSON string with navigation result (includes stealth features info on first nav)
     """
+    access_error = _guard_browser_access()
+    if access_error:
+        return access_error
+
     # Secret exfiltration protection — block URLs that embed API keys or
     # tokens in query parameters. A prompt injection could trick the agent
     # into navigating to https://evil.com/steal?key=sk-ant-... to exfil secrets.
@@ -1409,11 +1499,7 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         })
 
     # SSRF protection — block private/internal addresses before navigating.
-    # Skipped for local backends (Camofox, headless Chromium without a cloud
-    # provider) because the agent already has full local network access via
-    # the terminal tool.  Can also be opted out for cloud mode via
-    # ``browser.allow_private_urls`` in config.
-    if not _is_local_backend() and not _allow_private_urls() and not _is_safe_url(url):
+    if _should_enforce_private_url_guard() and not _allow_private_urls() and not _is_safe_url(url):
         return json.dumps({
             "success": False,
             "error": "Blocked: URL targets a private or internal address",
@@ -1431,7 +1517,12 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
     # Camofox backend — delegate after safety checks pass
     if _is_camofox_mode():
         from tools.browser_camofox import camofox_navigate
-        return camofox_navigate(url, task_id)
+        result_json = camofox_navigate(url, task_id)
+        if json.loads(result_json).get("success"):
+            guard_error = _guard_current_page_url(task_id)
+            if guard_error:
+                return guard_error
+        return result_json
 
     effective_task_id = task_id or "default"
     
@@ -1455,8 +1546,7 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         # Post-redirect SSRF check — if the browser followed a redirect to a
         # private/internal address, block the result so the model can't read
         # internal content via subsequent browser_snapshot calls.
-        # Skipped for local backends (same rationale as the pre-nav check).
-        if not _is_local_backend() and not _allow_private_urls() and final_url and final_url != url and not _is_safe_url(final_url):
+        if _should_enforce_private_url_guard() and not _allow_private_urls() and final_url and final_url != url and not _is_safe_url(final_url):
             # Navigate away to a blank page to prevent snapshot leaks
             _run_browser_command(effective_task_id, "open", ["about:blank"], timeout=10)
             return json.dumps({
@@ -1538,6 +1628,9 @@ def browser_snapshot(
     Returns:
         JSON string with page snapshot
     """
+    access_error = _guard_browser_access()
+    if access_error:
+        return access_error
     if _is_camofox_mode():
         from tools.browser_camofox import camofox_snapshot
         return camofox_snapshot(full, task_id, user_task)
@@ -1587,11 +1680,18 @@ def browser_click(ref: str, task_id: Optional[str] = None) -> str:
     Returns:
         JSON string with click result
     """
+    access_error = _guard_browser_access()
+    if access_error:
+        return access_error
+    effective_task_id = task_id or "default"
     if _is_camofox_mode():
         from tools.browser_camofox import camofox_click
-        return camofox_click(ref, task_id)
-
-    effective_task_id = task_id or "default"
+        result_json = camofox_click(ref, task_id)
+        if json.loads(result_json).get("success"):
+            guard_error = _guard_current_page_url(effective_task_id)
+            if guard_error:
+                return guard_error
+        return result_json
     
     # Ensure ref starts with @
     if not ref.startswith("@"):
@@ -1600,6 +1700,9 @@ def browser_click(ref: str, task_id: Optional[str] = None) -> str:
     result = _run_browser_command(effective_task_id, "click", [ref])
     
     if result.get("success"):
+        guard_error = _guard_current_page_url(effective_task_id)
+        if guard_error:
+            return guard_error
         return json.dumps({
             "success": True,
             "clicked": ref
@@ -1623,11 +1726,13 @@ def browser_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
     Returns:
         JSON string with type result
     """
+    access_error = _guard_browser_access()
+    if access_error:
+        return access_error
+    effective_task_id = task_id or "default"
     if _is_camofox_mode():
         from tools.browser_camofox import camofox_type
         return camofox_type(ref, text, task_id)
-
-    effective_task_id = task_id or "default"
     
     # Ensure ref starts with @
     if not ref.startswith("@"):
@@ -1672,6 +1777,10 @@ def browser_scroll(direction: str, task_id: Optional[str] = None) -> str:
     # ~500px is roughly half a viewport of travel.
     _SCROLL_PIXELS = 500
 
+    access_error = _guard_browser_access()
+    if access_error:
+        return access_error
+    effective_task_id = task_id or "default"
     if _is_camofox_mode():
         from tools.browser_camofox import camofox_scroll
         # Camofox REST API doesn't support pixel args; use repeated calls
@@ -1680,8 +1789,6 @@ def browser_scroll(direction: str, task_id: Optional[str] = None) -> str:
         for _ in range(_SCROLL_REPEATS):
             result = camofox_scroll(direction, task_id)
         return result
-
-    effective_task_id = task_id or "default"
 
     result = _run_browser_command(effective_task_id, "scroll", [direction, str(_SCROLL_PIXELS)])
     if not result.get("success"):
@@ -1706,14 +1813,20 @@ def browser_back(task_id: Optional[str] = None) -> str:
     Returns:
         JSON string with navigation result
     """
+    access_error = _guard_browser_access()
+    if access_error:
+        return access_error
+    effective_task_id = task_id or "default"
     if _is_camofox_mode():
         from tools.browser_camofox import camofox_back
         return camofox_back(task_id)
 
-    effective_task_id = task_id or "default"
     result = _run_browser_command(effective_task_id, "back", [])
     
     if result.get("success"):
+        guard_error = _guard_current_page_url(effective_task_id)
+        if guard_error:
+            return guard_error
         data = result.get("data", {})
         return json.dumps({
             "success": True,
@@ -1737,14 +1850,19 @@ def browser_press(key: str, task_id: Optional[str] = None) -> str:
     Returns:
         JSON string with key press result
     """
+    access_error = _guard_browser_access()
+    if access_error:
+        return access_error
+    effective_task_id = task_id or "default"
     if _is_camofox_mode():
         from tools.browser_camofox import camofox_press
         return camofox_press(key, task_id)
-
-    effective_task_id = task_id or "default"
     result = _run_browser_command(effective_task_id, "press", [key])
     
     if result.get("success"):
+        guard_error = _guard_current_page_url(effective_task_id)
+        if guard_error:
+            return guard_error
         return json.dumps({
             "success": True,
             "pressed": key
@@ -1774,6 +1892,15 @@ def browser_console(clear: bool = False, expression: Optional[str] = None, task_
     Returns:
         JSON string with console messages/errors, or eval result
     """
+    access_error = _guard_browser_access()
+    if access_error:
+        return access_error
+    effective_task_id = task_id or "default"
+
+    guard_error = _guard_current_page_url(effective_task_id)
+    if guard_error:
+        return guard_error
+
     # --- JS evaluation mode ---
     if expression is not None:
         return _browser_eval(expression, task_id)
@@ -1782,8 +1909,6 @@ def browser_console(clear: bool = False, expression: Optional[str] = None, task_
     if _is_camofox_mode():
         from tools.browser_camofox import camofox_console
         return camofox_console(clear, task_id)
-
-    effective_task_id = task_id or "default"
     
     console_args = ["--clear"] if clear else []
     error_args = ["--clear"] if clear else []
@@ -1951,6 +2076,9 @@ def browser_get_images(task_id: Optional[str] = None) -> str:
     Returns:
         JSON string with list of images (src and alt)
     """
+    access_error = _guard_browser_access()
+    if access_error:
+        return access_error
     if _is_camofox_mode():
         from tools.browser_camofox import camofox_get_images
         return camofox_get_images(task_id)
@@ -2019,6 +2147,9 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
     Returns:
         JSON string with vision analysis results and screenshot_path
     """
+    access_error = _guard_browser_access()
+    if access_error:
+        return access_error
     if _is_camofox_mode():
         from tools.browser_camofox import camofox_vision
         return camofox_vision(question, annotate, task_id)
@@ -2026,9 +2157,8 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
     import base64
     import uuid as uuid_mod
     from pathlib import Path
-    
+
     effective_task_id = task_id or "default"
-    
     # Save screenshot to persistent location so it can be shared with users
     from hermes_constants import get_hermes_dir
     screenshots_dir = get_hermes_dir("cache/screenshots", "browser_screenshots")
@@ -2078,7 +2208,9 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
                     f"or a stale daemon process."
                 ),
             }, ensure_ascii=False)
-        
+        from gateway.session_context import register_session_attachment_path
+        register_session_attachment_path(str(screenshot_path))
+
         # Convert screenshot to base64 at full resolution.
         _screenshot_bytes = screenshot_path.read_bytes()
         _screenshot_b64 = base64.b64encode(_screenshot_bytes).decode("ascii")
@@ -2172,6 +2304,8 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
         logger.warning("browser_vision failed: %s", e, exc_info=True)
         error_info = {"success": False, "error": f"Error during vision analysis: {str(e)}"}
         if screenshot_path.exists():
+            from gateway.session_context import register_session_attachment_path
+            register_session_attachment_path(str(screenshot_path))
             error_info["screenshot_path"] = str(screenshot_path)
             error_info["note"] = "Screenshot was captured but vision analysis failed. You can still share it via MEDIA:<path>."
         return json.dumps(error_info, ensure_ascii=False)

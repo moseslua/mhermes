@@ -16,6 +16,12 @@ import subprocess
 import sys
 from pathlib import Path
 
+from tools.plugin_guard import (
+    format_scan_report,
+    scan_plugin,
+    should_allow_plugin_install,
+ )
+
 from hermes_constants import get_hermes_home
 
 logger = logging.getLogger(__name__)
@@ -125,6 +131,106 @@ def _read_manifest(plugin_dir: Path) -> dict:
     except Exception as e:
         logger.warning("Failed to read plugin.yaml in %s: %s", plugin_dir, e)
         return {}
+
+
+def _validate_manifest_version(manifest: dict, plugin_name: str, console) -> None:
+    """Fail fast when a plugin manifest version is unsupported by this installer."""
+    mv = manifest.get("manifest_version")
+    if mv is None:
+        return
+    try:
+        mv_int = int(mv)
+    except (ValueError, TypeError):
+        console.print(
+            f"[red]Error:[/red] Plugin '{plugin_name}' has invalid "
+            f"manifest_version '{mv}' (expected an integer)."
+        )
+        sys.exit(1)
+    if mv_int > _SUPPORTED_MANIFEST_VERSION:
+        from hermes_cli.config import recommended_update_command
+        console.print(
+            f"[red]Error:[/red] Plugin '{plugin_name}' requires manifest_version "
+            f"{mv}, but this installer only supports up to {_SUPPORTED_MANIFEST_VERSION}.\n"
+            f"Run [bold]{recommended_update_command()}[/bold] to get a newer installer."
+        )
+        sys.exit(1)
+
+
+def _run_git_command(
+    args: list[str],
+    console,
+    *,
+    cwd: Path | None = None,
+    error_prefix: str,
+ ) -> subprocess.CompletedProcess[str]:
+    """Run a git command with consistent error handling."""
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            cwd=str(cwd) if cwd is not None else None,
+        )
+    except FileNotFoundError:
+        console.print("[red]Error:[/red] git is not installed or not in PATH.")
+        sys.exit(1)
+    except subprocess.TimeoutExpired:
+        console.print(f"[red]Error:[/red] {error_prefix} timed out after 60 seconds.")
+        sys.exit(1)
+
+    if result.returncode != 0:
+        details = result.stderr.strip() or result.stdout.strip() or "(no output)"
+        console.print(f"[red]Error:[/red] {error_prefix} failed:\n{details}")
+        sys.exit(1)
+
+    return result
+
+
+def _preserve_example_derived_files(existing_plugin_dir: Path, candidate_plugin_dir: Path) -> None:
+    """Copy user-maintained files that were originally materialized from *.example."""
+    if not existing_plugin_dir.exists():
+        return
+    for example_file in candidate_plugin_dir.glob("*.example"):
+        real_name = example_file.stem
+        candidate_real = candidate_plugin_dir / real_name
+        existing_real = existing_plugin_dir / real_name
+        if candidate_real.exists() or not existing_real.exists():
+            continue
+        shutil.copy2(existing_real, candidate_real)
+
+
+def _has_blocking_worktree_changes(plugin_dir: Path, status_output: str) -> bool:
+    """Return True when git status contains changes beyond installer-generated config files."""
+    if not status_output.strip():
+        return False
+    example_derived = {example.stem for example in plugin_dir.glob("*.example")}
+    for raw_line in status_output.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("?? "):
+            rel_path = line[3:].strip()
+            if "/" not in rel_path and Path(rel_path).name in example_derived:
+                continue
+        return True
+    return False
+
+
+def _run_plugin_guard(plugin_dir: Path, *, source: str, console, action: str) -> None:
+    """Scan a plugin before install/update or dashboard exposure."""
+    console.print("[bold]Running plugin security scan...[/]")
+    try:
+        result = scan_plugin(plugin_dir, source=source)
+    except Exception as exc:
+        console.print(f"[red]Error:[/red] Plugin security scan failed during {action}: {exc}")
+        sys.exit(1)
+
+    console.print(format_scan_report(result))
+    allowed, reason = should_allow_plugin_install(result)
+    if not allowed:
+        console.print(f"[bold red]{action.capitalize()} blocked:[/] {reason}")
+        sys.exit(1)
 
 
 def _copy_example_files(plugin_dir: Path, console) -> None:
@@ -308,25 +414,11 @@ def cmd_install(identifier: str, force: bool = False) -> None:
         tmp_target = Path(tmp) / "plugin"
         console.print(f"[dim]Cloning {git_url}...[/dim]")
 
-        try:
-            result = subprocess.run(
-                ["git", "clone", "--depth", "1", git_url, str(tmp_target)],
-                capture_output=True,
-                text=True,
-                timeout=60,
-            )
-        except FileNotFoundError:
-            console.print("[red]Error:[/red] git is not installed or not in PATH.")
-            sys.exit(1)
-        except subprocess.TimeoutExpired:
-            console.print("[red]Error:[/red] Git clone timed out after 60 seconds.")
-            sys.exit(1)
-
-        if result.returncode != 0:
-            console.print(
-                f"[red]Error:[/red] Git clone failed:\n{result.stderr.strip()}"
-            )
-            sys.exit(1)
+        result = _run_git_command(
+            ["clone", "--depth", "1", git_url, str(tmp_target)],
+            console,
+            error_prefix="Git clone",
+        )
 
         # Read manifest
         manifest = _read_manifest(tmp_target)
@@ -339,25 +431,9 @@ def cmd_install(identifier: str, force: bool = False) -> None:
             console.print(f"[red]Error:[/red] {e}")
             sys.exit(1)
 
-        # Check manifest_version compatibility
-        mv = manifest.get("manifest_version")
-        if mv is not None:
-            try:
-                mv_int = int(mv)
-            except (ValueError, TypeError):
-                console.print(
-                    f"[red]Error:[/red] Plugin '{plugin_name}' has invalid "
-                    f"manifest_version '{mv}' (expected an integer)."
-                )
-                sys.exit(1)
-            if mv_int > _SUPPORTED_MANIFEST_VERSION:
-                from hermes_cli.config import recommended_update_command
-                console.print(
-                    f"[red]Error:[/red] Plugin '{plugin_name}' requires manifest_version "
-                    f"{mv}, but this installer only supports up to {_SUPPORTED_MANIFEST_VERSION}.\n"
-                    f"Run [bold]{recommended_update_command()}[/bold] to get a newer installer."
-                )
-                sys.exit(1)
+        _validate_manifest_version(manifest, plugin_name, console)
+
+        _run_plugin_guard(tmp_target, source=git_url, console=console, action="install")
 
         if target.exists():
             if not force:
@@ -418,36 +494,85 @@ def cmd_update(name: str) -> None:
 
     console.print(f"[dim]Updating {name}...[/dim]")
 
-    try:
-        result = subprocess.run(
-            ["git", "pull", "--ff-only"],
-            capture_output=True,
-            text=True,
-            timeout=60,
-            cwd=str(target),
+    import tempfile
+    worktree_status = _run_git_command(
+        ["status", "--short"],
+        console,
+        cwd=target,
+        error_prefix="Checking plugin worktree status",
+    ).stdout.strip()
+    if _has_blocking_worktree_changes(target, worktree_status):
+        console.print(
+            f"[red]Error:[/red] Plugin '{name}' has local modifications. "
+            "Commit, stash, or remove them before updating so the scanned replacement "
+            "does not discard local work."
         )
-    except FileNotFoundError:
-        console.print("[red]Error:[/red] git is not installed or not in PATH.")
-        sys.exit(1)
-    except subprocess.TimeoutExpired:
-        console.print("[red]Error:[/red] Git pull timed out after 60 seconds.")
         sys.exit(1)
 
-    if result.returncode != 0:
-        console.print(f"[red]Error:[/red] Git pull failed:\n{result.stderr.strip()}")
-        sys.exit(1)
+
+
+    remote_url = _run_git_command(
+        ["config", "--get", "remote.origin.url"],
+        console,
+        cwd=target,
+        error_prefix="Reading plugin git remote",
+    ).stdout.strip()
+    branch = _run_git_command(
+        ["rev-parse", "--abbrev-ref", "HEAD"],
+        console,
+        cwd=target,
+        error_prefix="Reading plugin branch",
+    ).stdout.strip()
+    current_commit = _run_git_command(
+        ["rev-parse", "HEAD"],
+        console,
+        cwd=target,
+        error_prefix="Reading installed plugin commit",
+    ).stdout.strip()
+
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        candidate = Path(tmp) / "plugin"
+        clone_args = ["clone", "--depth", "1"]
+        if branch and branch != "HEAD":
+            clone_args.extend(["--branch", branch])
+        clone_args.extend([remote_url, str(candidate)])
+        _run_git_command(
+            clone_args,
+            console,
+            error_prefix="Cloning plugin update candidate",
+        )
+        candidate_manifest = _read_manifest(candidate)
+        candidate_name = candidate_manifest.get("name") or name
+        _validate_manifest_version(candidate_manifest, candidate_name, console)
+        _run_plugin_guard(candidate, source=remote_url, console=console, action="update")
+        scanned_commit = _run_git_command(
+            ["rev-parse", "HEAD"],
+            console,
+            cwd=candidate,
+            error_prefix="Reading scanned plugin commit",
+        ).stdout.strip()
+
+        if scanned_commit == current_commit:
+            console.print(
+                f"[green]✓[/green] Plugin [bold]{name}[/bold] is already up to date."
+            )
+            return
+
+    result = _run_git_command(
+        ["-c", "core.hooksPath=/dev/null", "pull", "--ff-only", "origin", scanned_commit],
+        console,
+        cwd=target,
+        error_prefix="Git pull",
+    )
 
     # Copy any new .example files
     _copy_example_files(target, console)
-
     output = result.stdout.strip()
-    if "Already up to date" in output:
-        console.print(
-            f"[green]✓[/green] Plugin [bold]{name}[/bold] is already up to date."
-        )
-    else:
-        console.print(f"[green]✓[/green] Plugin [bold]{name}[/bold] updated.")
+    if output:
         console.print(f"[dim]{output}[/dim]")
+    console.print(f"[green]✓[/green] Plugin [bold]{name}[/bold] updated.")
 
 
 def cmd_remove(name: str) -> None:

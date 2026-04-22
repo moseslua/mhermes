@@ -11,6 +11,8 @@ from tools.session_search_tool import (
     _HIDDEN_SESSION_SOURCES,
     MAX_SESSION_CHARS,
     SESSION_SEARCH_SCHEMA,
+    list_recent_history_records,
+    search_history_records,
 )
 
 
@@ -181,6 +183,287 @@ class TestTruncateAroundMatches:
         assert result.lower().count("alpha beta") == 2
 
 
+class TestStructuredHistoryHelpers:
+    def test_list_recent_history_records_excludes_current_lineage_and_child_sessions(self):
+        from unittest.mock import MagicMock
+
+        mock_db = MagicMock()
+        mock_db.list_sessions_rich.return_value = [
+            {
+                "id": "root_sid",
+                "title": "active",
+                "source": "cli",
+                "started_at": 1709500000,
+                "last_active": 1709500100,
+                "message_count": 2,
+                "preview": "active preview",
+                "parent_session_id": None,
+            },
+            {
+                "id": "child_sid",
+                "title": "child",
+                "source": "cli",
+                "started_at": 1709500001,
+                "last_active": 1709500101,
+                "message_count": 1,
+                "preview": "child preview",
+                "parent_session_id": "root_sid",
+            },
+            {
+                "id": "other_sid",
+                "title": "other",
+                "source": "telegram",
+                "started_at": 1709400000,
+                "last_active": 1709400100,
+                "message_count": 5,
+                "preview": "other preview",
+                "parent_session_id": None,
+            },
+        ]
+
+        def _get_session(session_id):
+            mapping = {
+                "current_child": {"parent_session_id": "root_sid"},
+                "root_sid": {"parent_session_id": None},
+                "child_sid": {"parent_session_id": "root_sid"},
+                "other_sid": {"parent_session_id": None},
+            }
+            return mapping.get(session_id)
+
+        def _get_messages(session_id):
+            mapping = {
+                "root_sid": [{"content": "root preview"}],
+                "child_sid": [{"content": "child preview from messages"}],
+                "other_sid": [{"content": "other preview from messages"}],
+            }
+            return mapping.get(session_id, [])
+
+        mock_db.get_session.side_effect = _get_session
+        mock_db.get_messages.side_effect = _get_messages
+
+        records = list_recent_history_records(
+            mock_db,
+            limit=3,
+            current_session_id="current_child",
+            user_id="user-123",
+            source="cli",
+        )
+
+        assert records == [
+            {
+                "session_id": "other_sid",
+                "title": "other",
+                "source": "telegram",
+                "started_at": 1709400000,
+                "last_active": 1709400100,
+                "message_count": 5,
+                "preview": "other preview from messages",
+            }
+        ]
+        mock_db.list_sessions_rich.assert_called_once_with(
+            source="cli",
+            limit=200,
+            offset=0,
+            exclude_sources=list(_HIDDEN_SESSION_SOURCES),
+            include_children=True,
+            user_id="user-123",
+        )
+
+    def test_search_history_records_excludes_current_lineage(self):
+        from unittest.mock import MagicMock
+
+        mock_db = MagicMock()
+        mock_db.search_messages.return_value = [
+            {
+                "session_id": "parent_sid",
+                "content": "match",
+                "source": "cli",
+                "session_started": 1709500000,
+                "model": "test",
+            },
+        ]
+
+        def _get_session(session_id):
+            mapping = {
+                "current_child": {"parent_session_id": "parent_sid"},
+                "parent_sid": {"parent_session_id": None},
+            }
+            return mapping.get(session_id)
+
+        mock_db.get_session.side_effect = _get_session
+
+        result = search_history_records(
+            query="test",
+            db=mock_db,
+            current_session_id="current_child",
+        )
+
+        assert result["results"] == []
+        assert result["count"] == 0
+        assert result["sessions_searched"] == 0
+        mock_db.get_messages_as_conversation.assert_not_called()
+
+    def test_search_history_records_returns_canonical_messages_without_llm(self):
+        from unittest.mock import MagicMock
+
+        mock_db = MagicMock()
+        mock_db.search_messages.return_value = [
+            {
+                "session_id": "child_sid",
+                "content": "match",
+                "source": "telegram",
+                "session_started": 1709400000,
+                "model": "test-model",
+            },
+        ]
+        messages = [
+            {"role": "user", "content": "hello from child"},
+            {"role": "assistant", "content": "hi there from child"},
+        ]
+
+        def _get_session(session_id):
+            mapping = {
+                "child_sid": {"parent_session_id": "root_sid"},
+                "root_sid": {"parent_session_id": None, "title": "resolved title", "source": "telegram"},
+                "current_sid": {"parent_session_id": None},
+            }
+            return mapping.get(session_id)
+
+        mock_db.get_session.side_effect = _get_session
+        mock_db.get_messages_as_conversation.side_effect = lambda sid: messages if sid == "child_sid" else []
+
+        result = search_history_records(
+            query="test",
+            role_filter="user,assistant",
+            db=mock_db,
+            current_session_id="current_sid",
+            user_id="user-123",
+            source="telegram",
+        )
+
+        assert result["count"] == 1
+        assert result["sessions_searched"] == 1
+        assert result["results"] == [
+            {
+                "session_id": "root_sid",
+                "title": "resolved title",
+                "when": _format_timestamp(1709400000),
+                "source": "telegram",
+                "model": "test-model",
+                "session_started": 1709400000,
+                "started_at": 1709400000,
+                "messages": messages,
+            }
+        ]
+        mock_db.search_messages.assert_called_once_with(
+            query="test",
+            source_filter=["telegram"],
+            role_filter=["user", "assistant"],
+            exclude_sources=list(_HIDDEN_SESSION_SOURCES),
+            limit=200,
+            offset=0,
+            user_id="user-123",
+        )
+        mock_db.get_messages_as_conversation.assert_called_once_with("child_sid")
+
+    def test_search_history_records_pages_past_current_lineage_saturation(self):
+        from unittest.mock import MagicMock
+
+        mock_db = MagicMock()
+        first_page = [
+            {
+                "session_id": "current-child",
+                "content": f"match {i}",
+                "source": "cli",
+                "session_started": 1709500000 + i,
+                "model": "test-model",
+            }
+            for i in range(200)
+        ]
+        second_page = [
+            {
+                "session_id": "other-root",
+                "content": "other match",
+                "source": "cli",
+                "session_started": 1709600000,
+                "model": "test-model",
+            }
+        ]
+        mock_db.search_messages.side_effect = [first_page, second_page, []]
+
+        def _get_session(session_id):
+            mapping = {
+                "current-child": {"parent_session_id": "current-root"},
+                "current-root": {"parent_session_id": None},
+                "other-root": {"parent_session_id": None, "title": "Other root", "source": "cli"},
+            }
+            return mapping.get(session_id)
+
+        mock_db.get_session.side_effect = _get_session
+        mock_db.get_messages_as_conversation.side_effect = lambda sid: [{"role": "user", "content": f"messages from {sid}"}]
+
+        result = search_history_records(
+            query="match",
+            db=mock_db,
+            current_session_id="current-child",
+            limit=1,
+        )
+
+        assert result["count"] == 1
+        assert result["results"][0]["session_id"] == "other-root"
+        assert mock_db.search_messages.call_count == 2
+
+    def test_list_recent_history_records_rolls_child_activity_to_parent(self):
+        from unittest.mock import MagicMock
+        db = MagicMock()
+        sessions = [
+            {
+                "id": "old-root",
+                "title": "old-root",
+                "source": "cli",
+                "started_at": 100.0,
+                "last_active": 100.0,
+                "message_count": 1,
+                "preview": "old-root",
+                "parent_session_id": None,
+            },
+            {
+                "id": "child-under-old",
+                "title": "child-under-old",
+                "source": "cli",
+                "started_at": 101.0,
+                "last_active": 999.0,
+                "message_count": 2,
+                "preview": "child-under-old",
+                "parent_session_id": "old-root",
+            },
+            {
+                "id": "new-root",
+                "title": "new-root",
+                "source": "cli",
+                "started_at": 200.0,
+                "last_active": 200.0,
+                "message_count": 1,
+                "preview": "new-root",
+                "parent_session_id": None,
+            },
+        ]
+        db.list_sessions_rich.side_effect = [sessions, []]
+        db.get_session.side_effect = lambda sid: {
+            "old-root": {"parent_session_id": None, "title": "old-root", "source": "cli", "started_at": 100.0},
+            "child-under-old": {"parent_session_id": "old-root"},
+            "new-root": {"parent_session_id": None, "title": "new-root", "source": "cli", "started_at": 200.0},
+        }.get(sid)
+        db.get_messages.side_effect = lambda sid: [{"content": f"preview from {sid}"}]
+
+        records = list_recent_history_records(db, limit=1)
+
+        assert records[0]["session_id"] == "old-root"
+        assert records[0]["last_active"] == 999.0
+        assert records[0]["message_count"] == 3
+        assert records[0]["preview"] == "preview from child-under-old"
+
+
 # =========================================================================
 # session_search (dispatcher)
 # =========================================================================
@@ -188,21 +471,36 @@ class TestTruncateAroundMatches:
 class TestSessionSearch:
     def test_no_db_returns_error(self):
         from tools.session_search_tool import session_search
+
         result = json.loads(session_search(query="test"))
         assert result["success"] is False
         assert "not available" in result["error"].lower()
 
-    def test_empty_query_returns_error(self):
+    def test_empty_query_returns_recent_sessions(self):
+        from unittest.mock import MagicMock
         from tools.session_search_tool import session_search
-        mock_db = object()
-        result = json.loads(session_search(query="", db=mock_db))
-        assert result["success"] is False
 
-    def test_whitespace_query_returns_error(self):
+        mock_db = MagicMock()
+        mock_db.list_sessions_rich.return_value = []
+
+        result = json.loads(session_search(query="", db=mock_db))
+
+        assert result["success"] is True
+        assert result["mode"] == "recent"
+        assert result["results"] == []
+
+    def test_whitespace_query_returns_recent_sessions(self):
+        from unittest.mock import MagicMock
         from tools.session_search_tool import session_search
-        mock_db = object()
+
+        mock_db = MagicMock()
+        mock_db.list_sessions_rich.return_value = []
+
         result = json.loads(session_search(query="   ", db=mock_db))
-        assert result["success"] is False
+
+        assert result["success"] is True
+        assert result["mode"] == "recent"
+        assert result["results"] == []
 
     def test_current_session_excluded(self):
         """session_search should never return the current session."""
@@ -247,9 +545,9 @@ class TestSessionSearch:
             {"role": "assistant", "content": "hi there"},
         ]
 
-        # Mock async_call_llm to raise RuntimeError → summarizer returns None
         from unittest.mock import AsyncMock, patch as _patch
-        with _patch("tools.session_search_tool.async_call_llm",
+        # Mock async_call_llm to raise RuntimeError → summarizer returns None
+        with _patch("tools.session_search_tool._call_session_search_llm",
                      new_callable=AsyncMock,
                      side_effect=RuntimeError("no provider")):
             result = json.loads(session_search(

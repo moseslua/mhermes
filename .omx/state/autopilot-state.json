@@ -1,0 +1,15 @@
+{
+  "active": true,
+  "current_phase": "execution",
+  "started_at": "2026-04-20T17:45:00Z",
+  "features": [
+    "Prompt Registry & Versioning",
+    "Elastic Replica Manager",
+    "Cost-Aware Model Router"
+  ],
+  "completed_at": "2026-04-20T00:00:00Z",
+  "task": "Hermes All-Features Integration",
+  "prd_path": ".omx/plans/prd-hermes-all-features-integration.md",
+  "test_spec_path": ".omx/plans/test-spec-hermes-all-features-integration.md",
+  "existing_impl_plan": ".omx/plans/autopilot-impl.md"
+}

@@ -26,6 +26,15 @@ We value contributions in this order:
 - Building a new skill? Start with [Creating Skills](./creating-skills.md)
 - Building a new inference provider? Start with [Adding Providers](./adding-providers.md)
 
+## AI-First Engineering
+
+Hermes is increasingly built and maintained with AI-assisted code generation. That raises the bar for planning, verification, and review — it does not lower it.
+
+- Plan before non-trivial implementation.
+- Prefer explicit acceptance criteria and verification evidence over anecdotes.
+- Review behavior regressions, security assumptions, data integrity, failure handling, rollout safety, and compatibility before style issues.
+- Treat generated code like any other risky change: add regression proof, explicit edge-case assertions, and focused integration checks when a boundary is crossed.
+
 ## Development Setup
 
 ### Prerequisites
@@ -80,9 +89,24 @@ hermes chat -q "Hello"
 
 ### Run Tests
 
+Use the canonical wrapper instead of raw `pytest` for normal local verification:
+
 ```bash
-pytest tests/ -v
+scripts/run_tests.sh                     # default Python suite (excludes integration/e2e)
+scripts/run_tests.sh tests/agent/        # one directory
+scripts/run_tests.sh tests/test_foo.py::test_bar
 ```
+
+If you touch `tests/integration`, `tests/e2e`, or another surface the wrapper intentionally skips, run that extra coverage explicitly and mention it in your verification notes.
+
+Use these direct pytest commands only for the suites the wrapper intentionally excludes:
+
+```bash
+source venv/bin/activate
+python -m pytest -o "addopts=" tests/integration/ -q -n 4
+python -m pytest -o "addopts=" tests/e2e/ -q -n 4
+```
+
 
 ## Code Style
 
@@ -175,7 +199,7 @@ refactor/description   # Code restructuring
 
 ### Before Submitting
 
-1. **Run tests**: `pytest tests/ -v`
+1. **Run tests**: `scripts/run_tests.sh` or a narrower command that you can justify in the PR
 2. **Test manually**: Run `hermes` and exercise the code path you changed
 3. **Check cross-platform impact**: Consider macOS and different Linux distros
 4. **Keep PRs focused**: One logical change per PR

@@ -6880,7 +6880,9 @@ For more help on a command:
         "create", aliases=["add"], help="Create a scheduled job"
     )
     cron_create.add_argument(
-        "schedule", help="Schedule like '30m', 'every 2h', or '0 9 * * *'"
+        "schedule",
+        nargs="?",
+        help="Optional schedule like '30m', 'every 2h', or '0 9 * * *'. Omit for reactive-only jobs created with trigger flags.",
     )
     cron_create.add_argument(
         "prompt", nargs="?", help="Optional self-contained prompt or task instruction"
@@ -6901,6 +6903,24 @@ For more help on a command:
         "--script",
         help="Path to a Python script whose stdout is injected into the prompt each run",
     )
+    cron_create.add_argument(
+        "--trigger-job",
+        dest="trigger_job_id",
+        help="Optional source job ID for a reactive trigger.",
+    )
+    cron_create.add_argument(
+        "--trigger-after-failures",
+        dest="trigger_after_failures",
+        type=int,
+        help="Consecutive-failure threshold for a reactive trigger (requires --trigger-job).",
+    )
+    cron_create.add_argument(
+        "--reactive-only",
+        action="store_true",
+        help="Treat the first positional argument as the prompt and omit the schedule; requires reactive trigger flags.",
+    )
+
+
 
     # cron edit
     cron_edit = cron_subparsers.add_parser(
@@ -6939,6 +6959,30 @@ For more help on a command:
         "--script",
         help="Path to a Python script whose stdout is injected into the prompt each run. Pass empty string to clear.",
     )
+    cron_edit.add_argument(
+        "--clear-schedule",
+        action="store_true",
+        help="Clear the schedule so the job becomes reactive-only (requires a reactive trigger).",
+    )
+
+    cron_edit.add_argument(
+        "--trigger-job",
+        dest="trigger_job_id",
+        help="Set or replace the source job ID for a reactive trigger.",
+    )
+    cron_edit.add_argument(
+        "--trigger-after-failures",
+        dest="trigger_after_failures",
+        type=int,
+        help="Set the consecutive-failure threshold for a reactive trigger (requires --trigger-job).",
+    )
+    cron_edit.add_argument(
+        "--clear-trigger",
+        action="store_true",
+        help="Remove the reactive trigger from the job.",
+    )
+
+
 
     # lifecycle actions
     cron_pause = cron_subparsers.add_parser("pause", help="Pause a scheduled job")
@@ -6965,6 +7009,36 @@ For more help on a command:
 
     cron_parser.set_defaults(func=cmd_cron)
 
+    # =========================================================================
+    # specialist command
+    # =========================================================================
+    specialist_parser = subparsers.add_parser(
+        "specialist",
+        aliases=["spec"],
+        help="Manage domain specialists",
+        description="Create, list, edit, delete, and show Hermes domain specialists.",
+    )
+    specialist_subparsers = specialist_parser.add_subparsers(dest="specialist_command")
+
+    specialist_create = specialist_subparsers.add_parser("create", help="Create a new specialist")
+    specialist_create.add_argument("name", nargs="?", help="Specialist name")
+
+    specialist_subparsers.add_parser("list", help="List all specialists")
+
+    specialist_show = specialist_subparsers.add_parser("show", help="Show specialist details")
+    specialist_show.add_argument("name", help="Specialist name")
+
+    specialist_edit = specialist_subparsers.add_parser("edit", help="Edit a specialist")
+    specialist_edit.add_argument("name", help="Specialist name")
+
+    specialist_delete = specialist_subparsers.add_parser("delete", help="Delete a specialist")
+    specialist_delete.add_argument("name", help="Specialist name")
+
+    def cmd_specialist(args):
+        from hermes_cli.specialist_commands import specialist_command
+        sys.exit(specialist_command(args))
+
+    specialist_parser.set_defaults(func=cmd_specialist)
     # =========================================================================
     # webhook command
     # =========================================================================

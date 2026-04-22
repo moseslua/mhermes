@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
@@ -79,9 +80,7 @@ class TestResolveDeliveryTarget:
             ("qqbot", "QQ_HOME_CHANNEL", "group-openid-home"),
         ],
     )
-    def test_origin_delivery_without_origin_falls_back_to_supported_home_channels(
-        self, monkeypatch, platform, env_var, chat_id
-    ):
+    def test_origin_delivery_without_origin_fails_closed(self, monkeypatch, platform, env_var, chat_id):
         for fallback_env in (
             "MATRIX_HOME_ROOM",
             "MATRIX_HOME_CHANNEL",
@@ -102,11 +101,7 @@ class TestResolveDeliveryTarget:
             monkeypatch.delenv(fallback_env, raising=False)
         monkeypatch.setenv(env_var, chat_id)
 
-        assert _resolve_delivery_target({"deliver": "origin"}) == {
-            "platform": platform,
-            "chat_id": chat_id,
-            "thread_id": None,
-        }
+        assert _resolve_delivery_target({"deliver": "origin"}) is None
 
     def test_bare_matrix_delivery_uses_matrix_home_room(self, monkeypatch):
         monkeypatch.delenv("MATRIX_HOME_CHANNEL", raising=False)
@@ -365,13 +360,11 @@ class TestDeliverResultWrapping:
         # Text content should have MEDIA: tag stripped
         assert "MEDIA:" not in args[3]
         assert "Title" in args[3]
-        # Media files should be forwarded separately
-        assert kwargs["media_files"] == [("/tmp/test-voice.ogg", False)]
+        # Cron auto-delivery never forwards attachments
+        assert kwargs["media_files"] == []
 
-    def test_live_adapter_sends_media_as_attachments(self):
-        """When a live adapter is available, MEDIA files should be sent as native
-        platform attachments (e.g., Discord voice, Telegram audio) rather than
-        as literal 'MEDIA:/path' text."""
+    def test_live_adapter_does_not_send_media_as_attachments(self):
+        """Cron auto-delivery strips MEDIA tags and sends text only."""
         from gateway.config import Platform
         from concurrent.futures import Future
 
@@ -387,7 +380,6 @@ class TestDeliverResultWrapping:
         loop = MagicMock()
         loop.is_running.return_value = True
 
-        # run_coroutine_threadsafe returns concurrent.futures.Future (has timeout kwarg)
         def fake_run_coro(coro, _loop):
             future = Future()
             future.set_result(MagicMock(success=True))
@@ -410,25 +402,21 @@ class TestDeliverResultWrapping:
                 loop=loop,
             )
 
-        # Text should be sent without the MEDIA tag
         adapter.send.assert_called_once()
         text_sent = adapter.send.call_args[0][1]
         assert "MEDIA:" not in text_sent
         assert "Here is TTS" in text_sent
+        adapter.send_voice.assert_not_called()
 
-        # Audio file should be sent as a voice attachment
-        adapter.send_voice.assert_called_once()
-        voice_call = adapter.send_voice.call_args
-        assert voice_call[1]["audio_path"] == "/tmp/cron-voice.mp3"
-
-    def test_live_adapter_routes_image_to_send_image_file(self):
-        """Image MEDIA files should be routed to send_image_file, not send_voice."""
+    def test_live_adapter_does_not_route_image_attachment(self):
+        """Image MEDIA tags are stripped from cron auto-delivery instead of uploaded."""
         from gateway.config import Platform
         from concurrent.futures import Future
 
         adapter = AsyncMock()
         adapter.send.return_value = MagicMock(success=True)
         adapter.send_image_file.return_value = MagicMock(success=True)
+        adapter.send_voice.return_value = MagicMock(success=True)
 
         pconfig = MagicMock()
         pconfig.enabled = True
@@ -447,30 +435,28 @@ class TestDeliverResultWrapping:
         job = {
             "id": "img-job",
             "deliver": "origin",
-            "origin": {"platform": "discord", "chat_id": "1234"},
+            "origin": {"platform": "discord", "chat_id": "9876"},
         }
 
         with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
              patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
              patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro):
-            _deliver_result(
-                job,
-                "Chart attached\nMEDIA:/tmp/chart.png",
-                adapters={Platform.DISCORD: adapter},
-                loop=loop,
-            )
+            _deliver_result(job, "Chart attached\nMEDIA:/tmp/chart.png", adapters={Platform.DISCORD: adapter}, loop=loop)
 
-        adapter.send_image_file.assert_called_once()
-        assert adapter.send_image_file.call_args[1]["image_path"] == "/tmp/chart.png"
+        adapter.send.assert_called_once()
+        assert "MEDIA:" not in adapter.send.call_args[0][1]
+        adapter.send_image_file.assert_not_called()
         adapter.send_voice.assert_not_called()
 
-    def test_live_adapter_media_only_no_text(self):
-        """When content is ONLY a MEDIA tag with no text, media should still be sent."""
+
+    def test_live_adapter_media_only_no_text_becomes_noop_text_send(self):
+        """Media-only cron output does not upload attachments and sends no text."""
         from gateway.config import Platform
         from concurrent.futures import Future
 
         adapter = AsyncMock()
         adapter.send_voice.return_value = MagicMock(success=True)
+        adapter.send.return_value = MagicMock(success=True)
 
         pconfig = MagicMock()
         pconfig.enabled = True
@@ -495,17 +481,16 @@ class TestDeliverResultWrapping:
         with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
              patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
              patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro):
-            _deliver_result(
+            result = _deliver_result(
                 job,
                 "MEDIA:/tmp/voice.ogg",
                 adapters={Platform.TELEGRAM: adapter},
                 loop=loop,
             )
 
-        # Text send should NOT be called (no text after stripping MEDIA tag)
+        assert "media-only" in result
         adapter.send.assert_not_called()
-        # Audio should still be delivered
-        adapter.send_voice.assert_called_once()
+        adapter.send_voice.assert_not_called()
 
     def test_live_adapter_sends_cleaned_text_not_raw(self):
         """The live adapter path must send cleaned text (MEDIA tags stripped),
@@ -629,6 +614,129 @@ class TestDeliverResultErrorReturns:
         assert "no delivery target" in result
 
 
+    def test_live_adapter_still_used_for_unrelated_env_overrides(self):
+        from gateway.config import Platform
+        from concurrent.futures import Future
+
+        adapter = AsyncMock()
+        adapter.send.return_value = MagicMock(success=True)
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        def fake_run_coro(coro, _loop):
+            future = Future()
+            future.set_result(MagicMock(success=True))
+            coro.close()
+            return future
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro):
+            result = _deliver_result(
+                {"id": "env-live-adapter", "deliver": "origin", "origin": {"platform": "telegram", "chat_id": "123"}},
+                "Hello",
+                adapters={Platform.TELEGRAM: adapter},
+                loop=loop,
+                env_overrides={"OPENROUTER_API_KEY": "x"},
+            )
+
+        assert result is None
+        adapter.send.assert_called_once()
+
+
+    def test_matrix_live_adapter_kept_when_overrides_match_adapter_config(self):
+        from gateway.config import Platform
+        from concurrent.futures import Future
+
+        pconfig = SimpleNamespace(enabled=True, token="matrix-token", extra={"homeserver": "https://matrix.example.org"})
+        adapter = AsyncMock()
+        adapter.config = SimpleNamespace(token="matrix-token", extra={"homeserver": "https://matrix.example.org"})
+        adapter.send.return_value = MagicMock(success=True)
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.MATRIX: pconfig}
+
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        def fake_run_coro(coro, _loop):
+            future = Future()
+            future.set_result(MagicMock(success=True))
+            coro.close()
+            return future
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro):
+            result = _deliver_result(
+                {"id": "matrix-live-adapter", "deliver": "origin", "origin": {"platform": "matrix", "chat_id": "!room:example.org"}},
+                "Hello",
+                adapters={Platform.MATRIX: adapter},
+                loop=loop,
+                env_overrides={
+                    "MATRIX_ACCESS_TOKEN": "matrix-token",
+                    "MATRIX_HOMESERVER": "https://matrix.example.org",
+                },
+            )
+
+        assert result is None
+        adapter.send.assert_called_once()
+
+
+    def test_resolves_targets_from_env_overrides(self, monkeypatch):
+        from gateway.config import Platform
+
+        monkeypatch.delenv("TELEGRAM_HOME_CHANNEL", raising=False)
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}):
+            job = {"id": "env-target", "deliver": "telegram"}
+            result = _deliver_result(job, "Output.", env_overrides={"TELEGRAM_HOME_CHANNEL": "-2002"})
+
+        assert result is None
+        assert send_mock.call_args[0][2] == "-2002"
+    def test_home_channel_falls_back_to_process_env_when_unrelated_overrides_present(self, monkeypatch):
+        monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "-123")
+        assert _resolve_delivery_target({"deliver": "telegram"}, env_overrides={"OPENROUTER_API_KEY": "x"}) == {
+            "platform": "telegram",
+            "chat_id": "-123",
+            "thread_id": None,
+        }
+
+
+    def test_cron_delivery_warns_when_local_file_path_is_removed(self, tmp_path):
+        from gateway.config import Platform
+        artifact = tmp_path / "report.png"
+        artifact.write_bytes(b"png")
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}):
+            job = {"id": "path-warn", "deliver": "origin", "origin": {"platform": "telegram", "chat_id": "123"}}
+            result = _deliver_result(job, f"Report ready {artifact}")
+
+        assert result is None
+        sent_content = send_mock.call_args.args[3]
+        assert str(artifact) not in sent_content
+        assert "blocked one or more file attachments" in sent_content
+
+
+
+
 class TestRunJobSessionPersistence:
     def test_run_job_passes_session_db_and_cron_platform(self, tmp_path):
         job = {
@@ -672,6 +780,109 @@ class TestRunJobSessionPersistence:
         assert call_args[0][0].startswith("cron_test-job_")
         assert call_args[0][1] == "cron_complete"
         fake_db.close.assert_called_once()
+
+    def test_run_job_disables_local_access_toolsets_for_unattended_jobs(self, tmp_path):
+        job = {
+            "id": "plain-cron-job",
+            "name": "plain cron",
+            "prompt": "hello",
+        }
+        fake_db = MagicMock()
+        captured_kwargs = {}
+
+        class FakeAgent:
+            def __init__(self, *args, **kwargs):
+                captured_kwargs.update(kwargs)
+
+            def run_conversation(self, *args, **kwargs):
+                return {"final_response": "ok"}
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "test-key",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent", FakeAgent):
+            success, output, final_response, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert set(captured_kwargs["enabled_toolsets"]) == {
+            "web",
+            "vision",
+            "image_gen",
+            "skills",
+            "todo",
+            "memory",
+        }
+        assert captured_kwargs["disabled_toolsets"] == ["messaging", "clarify"]
+
+    def test_run_job_prompt_build_failure_returns_structured_error(self, tmp_path):
+        job = {
+            "id": "prompt-build-fail",
+            "name": "prompt build fail",
+            "prompt": "hello",
+        }
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._build_job_prompt", side_effect=RuntimeError("boom")):
+            success, output, final_response, error = run_job(job)
+
+        assert success is False
+        assert final_response == ""
+        assert error == "RuntimeError: boom"
+        assert "## Error" in output
+        assert "hello" in output
+
+
+    def test_run_job_script_backed_jobs_disable_risky_toolsets(self, tmp_path):
+        job = {
+            "id": "scripted-job",
+            "name": "scripted job",
+            "prompt": "hello",
+            "script": "collector.py",
+        }
+        fake_db = MagicMock()
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("cron.scheduler._run_job_script", return_value=(True, "regular output")), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "test-key",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+
+            success, output, final_response, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        kwargs = mock_agent_cls.call_args.kwargs
+        assert set(kwargs["enabled_toolsets"]) == {
+            "web",
+            "vision",
+            "image_gen",
+            "skills",
+            "todo",
+            "memory",
+        }
+        assert kwargs["disabled_toolsets"] == ["messaging", "clarify"]
+
 
     def test_run_job_empty_response_returns_empty_not_placeholder(self, tmp_path):
         """Empty final_response should stay empty for delivery logic (issue #2234).
@@ -736,12 +947,15 @@ class TestRunJobSessionPersistence:
         fake_db = MagicMock()
 
         with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._LOCK_DIR", tmp_path / "cron"), \
+             patch("cron.scheduler._LOCK_FILE", tmp_path / "cron" / ".tick.lock"), \
              patch("cron.scheduler.get_due_jobs", return_value=[job]), \
              patch("cron.scheduler.advance_next_run"), \
              patch("cron.scheduler.mark_job_run") as mock_mark, \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
              patch("cron.scheduler._resolve_origin", return_value=None), \
              patch("cron.scheduler.run_job", return_value=(True, "output", "", None)):
+
             tick(verbose=False)
 
         # Should be called with success=False because final_response is empty
@@ -772,9 +986,10 @@ class TestRunJobSessionPersistence:
                 pass
 
             def run_conversation(self, *args, **kwargs):
-                seen["platform"] = os.getenv("HERMES_CRON_AUTO_DELIVER_PLATFORM")
-                seen["chat_id"] = os.getenv("HERMES_CRON_AUTO_DELIVER_CHAT_ID")
-                seen["thread_id"] = os.getenv("HERMES_CRON_AUTO_DELIVER_THREAD_ID")
+                from gateway.session_context import get_session_env
+                seen["platform"] = get_session_env("HERMES_CRON_AUTO_DELIVER_PLATFORM")
+                seen["chat_id"] = get_session_env("HERMES_CRON_AUTO_DELIVER_CHAT_ID")
+                seen["thread_id"] = get_session_env("HERMES_CRON_AUTO_DELIVER_THREAD_ID") or None
                 return {"final_response": "ok"}
 
         with patch("cron.scheduler._hermes_home", tmp_path), \
@@ -804,6 +1019,171 @@ class TestRunJobSessionPersistence:
         assert os.getenv("HERMES_CRON_AUTO_DELIVER_CHAT_ID") is None
         assert os.getenv("HERMES_CRON_AUTO_DELIVER_THREAD_ID") is None
         fake_db.close.assert_called_once()
+
+    def test_run_job_propagates_origin_user_id_into_session_context(self, tmp_path):
+        job = {
+            "id": "user-scope-job",
+            "name": "user scope",
+            "prompt": "hello",
+        }
+        fake_db = MagicMock()
+        seen = {}
+
+        class FakeAgent:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def run_conversation(self, *args, **kwargs):
+                from gateway.session_context import get_session_env
+                seen["user_id"] = get_session_env("HERMES_SESSION_USER_ID")
+                return {"final_response": "ok"}
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value={"platform": "telegram", "chat_id": "123", "chat_name": "Chat", "thread_id": None, "user_id": "u-42"}), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "***",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent", FakeAgent):
+            success, output, final_response, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert seen["user_id"] == "u-42"
+        assert final_response == "ok"
+        assert "ok" in output
+        assert os.getenv("HERMES_CRON_AUTO_DELIVER_CHAT_ID") is None
+        assert os.getenv("HERMES_CRON_AUTO_DELIVER_THREAD_ID") is None
+        fake_db.close.assert_called_once()
+
+    def test_run_job_uses_env_override_provider_key(self, tmp_path, monkeypatch):
+        job = {
+            "id": "provider-job",
+            "name": "provider-test",
+            "prompt": "hello",
+        }
+        fake_db = MagicMock()
+        (tmp_path / ".env").write_text("HERMES_INFERENCE_PROVIDER=anthropic\nANTHROPIC_API_KEY=cron-key\n")
+        monkeypatch.delenv("HERMES_INFERENCE_PROVIDER", raising=False)
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+        seen_runtime_kwargs = {}
+
+        class FakeAgent:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def run_conversation(self, *args, **kwargs):
+                return {"final_response": "ok"}
+
+        def fake_resolve_runtime_provider(**kwargs):
+            seen_runtime_kwargs.update(kwargs)
+            return {
+                "api_key": kwargs.get("explicit_api_key"),
+                "base_url": "https://example.invalid/v1",
+                "provider": kwargs.get("requested") or "anthropic",
+                "api_mode": "chat_completions",
+            }
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch("hermes_cli.runtime_provider.resolve_runtime_provider", side_effect=fake_resolve_runtime_provider), \
+             patch("run_agent.AIAgent", FakeAgent):
+            success, output, final_response, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert seen_runtime_kwargs["requested"] == "anthropic"
+        assert seen_runtime_kwargs["explicit_api_key"] == "cron-key"
+
+    def test_run_job_ignores_blank_provider_env_overrides(self, tmp_path, monkeypatch):
+        job = {
+            "id": "provider-blank-job",
+            "name": "provider-blank-test",
+            "prompt": "hello",
+        }
+        fake_db = MagicMock()
+        (tmp_path / ".env").write_text("GOOGLE_API_KEY=\nOPENROUTER_API_KEY=real-key\n")
+        monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+
+        seen_runtime_kwargs = {}
+
+        class FakeAgent:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def run_conversation(self, *args, **kwargs):
+                return {"final_response": "ok"}
+
+        def fake_resolve_runtime_provider(**kwargs):
+            seen_runtime_kwargs.update(kwargs)
+            return {
+                "api_key": kwargs.get("explicit_api_key"),
+                "base_url": "https://example.invalid/v1",
+                "provider": kwargs.get("requested") or "openrouter",
+                "api_mode": "chat_completions",
+            }
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch("hermes_cli.runtime_provider.resolve_runtime_provider", side_effect=fake_resolve_runtime_provider), \
+             patch("run_agent.AIAgent", FakeAgent):
+            success, output, final_response, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert seen_runtime_kwargs.get("requested") in (None, "")
+        assert seen_runtime_kwargs.get("explicit_api_key") in (None, "")
+
+
+
+
+    def test_run_job_prefers_env_overrides_for_model_and_iterations(self, tmp_path, monkeypatch):
+        job = {
+            "id": "env-precedence-job",
+            "name": "env-precedence-test",
+            "prompt": "hello",
+        }
+        fake_db = MagicMock()
+        (tmp_path / ".env").write_text("HERMES_MODEL=env-model\nHERMES_MAX_ITERATIONS=7\n")
+        (tmp_path / "config.yaml").write_text("model:\n  default: config-model\nagent:\n  max_turns: 123\n")
+        monkeypatch.delenv("HERMES_MODEL", raising=False)
+        monkeypatch.delenv("HERMES_MAX_ITERATIONS", raising=False)
+
+        captured_kwargs = {}
+
+        class FakeAgent:
+            def __init__(self, *args, **kwargs):
+                captured_kwargs.update(kwargs)
+
+            def run_conversation(self, *args, **kwargs):
+                return {"final_response": "ok"}
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "test-key",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent", FakeAgent):
+            success, output, final_response, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert captured_kwargs["model"] == "env-model"
+        assert captured_kwargs["max_iterations"] == 7
 
 
 class TestRunJobConfigLogging:
@@ -1012,7 +1392,14 @@ class TestRunJobSkillBacked:
         assert final_response == "ok"
 
         kwargs = mock_agent_cls.call_args.kwargs
-        assert "cronjob" in (kwargs["disabled_toolsets"] or [])
+        assert set(kwargs["enabled_toolsets"]) == {
+            "web",
+            "vision",
+            "image_gen",
+            "skills",
+            "todo",
+            "memory",
+        }
 
         prompt_arg = mock_agent.run_conversation.call_args.args[0]
         assert "blogwatcher" in prompt_arg
@@ -1089,7 +1476,7 @@ class TestSilentDelivery:
         deliver_mock.assert_not_called()
         assert any(SILENT_MARKER in r.message for r in caplog.records)
 
-    def test_silent_with_note_suppresses_delivery(self):
+    def test_silent_with_note_still_delivers(self):
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
              patch("cron.scheduler.run_job", return_value=(True, "# output", "[SILENT] No changes detected", None)), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
@@ -1097,10 +1484,10 @@ class TestSilentDelivery:
              patch("cron.scheduler.mark_job_run"):
             from cron.scheduler import tick
             tick(verbose=False)
-        deliver_mock.assert_not_called()
+        deliver_mock.assert_called_once()
 
-    def test_silent_trailing_suppresses_delivery(self):
-        """Agent appended [SILENT] after explanation text — must still suppress."""
+    def test_silent_trailing_still_delivers(self):
+        """Agent appended [SILENT] after explanation text — must not suppress."""
         response = "2 deals filtered out (like<10, reply<15).\n\n[SILENT]"
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
              patch("cron.scheduler.run_job", return_value=(True, "# output", response, None)), \
@@ -1109,9 +1496,9 @@ class TestSilentDelivery:
              patch("cron.scheduler.mark_job_run"):
             from cron.scheduler import tick
             tick(verbose=False)
-        deliver_mock.assert_not_called()
+        deliver_mock.assert_called_once()
 
-    def test_silent_is_case_insensitive(self):
+    def test_silent_with_extra_text_is_case_insensitive_but_still_delivers(self):
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
              patch("cron.scheduler.run_job", return_value=(True, "# output", "[silent] nothing new", None)), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
@@ -1119,7 +1506,7 @@ class TestSilentDelivery:
              patch("cron.scheduler.mark_job_run"):
             from cron.scheduler import tick
             tick(verbose=False)
-        deliver_mock.assert_not_called()
+        deliver_mock.assert_called_once()
 
     def test_failed_job_always_delivers(self):
         """Failed jobs deliver regardless of [SILENT] in output."""
@@ -1258,6 +1645,15 @@ class TestRunJobWakeGate:
 
         with patch.object(scheduler, "_run_job_script",
                           return_value=(True, '{"wakeAgent": false}')), \
+             patch(
+                "hermes_cli.runtime_provider.resolve_runtime_provider",
+                return_value={
+                    "api_key": "***",
+                    "base_url": "https://example.invalid/v1",
+                    "provider": "openrouter",
+                    "api_mode": "chat_completions",
+                },
+             ), \
              patch("run_agent.AIAgent") as agent_cls:
             success, doc, final, err = scheduler.run_job(self._make_job())
 
@@ -1279,6 +1675,15 @@ class TestRunJobWakeGate:
         })
         with patch.object(scheduler, "_run_job_script",
                           return_value=(True, script_output)), \
+             patch(
+                "hermes_cli.runtime_provider.resolve_runtime_provider",
+                return_value={
+                    "api_key": "***",
+                    "base_url": "https://example.invalid/v1",
+                    "provider": "openrouter",
+                    "api_mode": "chat_completions",
+                },
+             ), \
              patch("run_agent.AIAgent", return_value=agent) as agent_cls:
             success, doc, final, err = scheduler.run_job(self._make_job())
 
@@ -1298,7 +1703,7 @@ class TestRunJobWakeGate:
         import cron.scheduler as scheduler
 
         call_count = 0
-        def _script_stub(path):
+        def _script_stub(path, env_overrides=None):
             nonlocal call_count
             call_count += 1
             return (True, "regular output")
@@ -1308,11 +1713,19 @@ class TestRunJobWakeGate:
             "final_response": "ok", "messages": []
         })
         with patch.object(scheduler, "_run_job_script", side_effect=_script_stub), \
+             patch(
+                "hermes_cli.runtime_provider.resolve_runtime_provider",
+                return_value={
+                    "api_key": "***",
+                    "base_url": "https://example.invalid/v1",
+                    "provider": "openrouter",
+                    "api_mode": "chat_completions",
+                },
+             ), \
              patch("run_agent.AIAgent", return_value=agent):
             scheduler.run_job(self._make_job())
 
         assert call_count == 1, f"script ran {call_count}x, expected exactly 1"
-
     def test_script_failure_does_not_trigger_gate(self):
         """If _run_job_script returns success=False, the gate is NOT evaluated
         and the agent still runs (the failure is reported as context)."""
@@ -1326,6 +1739,15 @@ class TestRunJobWakeGate:
         })
         with patch.object(scheduler, "_run_job_script",
                           return_value=(False, '{"wakeAgent": false}')), \
+             patch(
+                "hermes_cli.runtime_provider.resolve_runtime_provider",
+                return_value={
+                    "api_key": "***",
+                    "base_url": "https://example.invalid/v1",
+                    "provider": "openrouter",
+                    "api_mode": "chat_completions",
+                },
+             ), \
              patch("run_agent.AIAgent", return_value=agent) as agent_cls:
             success, doc, final, err = scheduler.run_job(self._make_job())
 
@@ -1342,12 +1764,35 @@ class TestRunJobWakeGate:
         job = self._make_job(script=None)
         job.pop("script", None)
         with patch.object(scheduler, "_run_job_script") as script_fn, \
+             patch(
+                "hermes_cli.runtime_provider.resolve_runtime_provider",
+                return_value={
+                    "api_key": "***",
+                    "base_url": "https://example.invalid/v1",
+                    "provider": "openrouter",
+                    "api_mode": "chat_completions",
+                },
+             ), \
              patch("run_agent.AIAgent", return_value=agent) as agent_cls:
             scheduler.run_job(job)
 
         script_fn.assert_not_called()
         agent_cls.assert_called_once()
 
+
+
+class TestBuildJobPromptOrdering:
+    def test_skill_jobs_still_start_with_cron_hint(self):
+        import cron.scheduler as scheduler
+
+        with patch("tools.skills_tool.skill_view", return_value=json.dumps({"success": True, "content": "# Skill\nDo the thing"})):
+            prompt = scheduler._build_job_prompt({
+                "prompt": "Inspect the fleet",
+                "skills": ["hermes-cron-health"],
+            })
+
+        assert prompt.startswith("[SYSTEM: You are running as a scheduled cron job.")
+        assert 'The user has invoked the "hermes-cron-health" skill' in prompt
 
 class TestBuildJobPromptMissingSkill:
     """Verify that a missing skill logs a warning and does not crash the job."""

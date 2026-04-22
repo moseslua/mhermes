@@ -471,20 +471,10 @@ def handle_function_call(
             if block_message is not None:
                 return json.dumps({"error": block_message}, ensure_ascii=False)
         else:
-            # Still fire the hook for observers — just don't check for blocking
-            # (the caller already did that).
-            try:
-                from hermes_cli.plugins import invoke_hook
-                invoke_hook(
-                    "pre_tool_call",
-                    tool_name=function_name,
-                    args=function_args,
-                    task_id=task_id or "",
-                    session_id=session_id or "",
-                    tool_call_id=tool_call_id or "",
-                )
-            except Exception:
-                pass
+            # Caller already emitted any pre_tool_call observers and/or blocking
+            # behavior (for example run_agent._invoke_tool). Skip here to avoid
+            # double-firing plugin hooks on the same logical tool call.
+            pass
 
         # Notify the read-loop tracker when a non-read/search tool runs,
         # so the *consecutive* counter resets (reads after other work are fine).

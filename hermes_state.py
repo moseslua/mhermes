@@ -22,8 +22,9 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
-from hermes_constants import get_hermes_home
 from typing import Any, Callable, Dict, List, Optional, TypeVar
+from agent.runtime_signals import RuntimeSignal
+from hermes_constants import get_hermes_home
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +32,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 8
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -46,6 +47,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     model_config TEXT,
     system_prompt TEXT,
     parent_session_id TEXT,
+    attached_mission_id TEXT,
+    local_todo_state TEXT,
     started_at REAL NOT NULL,
     ended_at REAL,
     end_reason TEXT,
@@ -82,12 +85,113 @@ CREATE TABLE IF NOT EXISTS messages (
     reasoning TEXT,
     reasoning_details TEXT,
     codex_reasoning_items TEXT
-);
+ );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
+"""
+
+RUNTIME_SIGNAL_AUDIT_SQL = """
+CREATE TABLE IF NOT EXISTS runtime_signal_audit (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT NOT NULL UNIQUE,
+    idempotency_key TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    phase TEXT NOT NULL,
+    occurred_at REAL NOT NULL,
+    publisher TEXT NOT NULL,
+    session_id TEXT,
+    mission_id TEXT,
+    correlation_id TEXT NOT NULL,
+    sequence_no INTEGER,
+    actor_json TEXT,
+    subject_json TEXT,
+    provenance TEXT NOT NULL,
+    payload_json TEXT,
+    payload_bytes INTEGER NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL
+ );
+CREATE INDEX IF NOT EXISTS idx_runtime_signal_session ON runtime_signal_audit(session_id, id);
+CREATE INDEX IF NOT EXISTS idx_runtime_signal_type_time ON runtime_signal_audit(event_type, occurred_at DESC);
+CREATE INDEX IF NOT EXISTS idx_runtime_signal_correlation ON runtime_signal_audit(correlation_id);
+CREATE INDEX IF NOT EXISTS idx_runtime_signal_idempotency ON runtime_signal_audit(idempotency_key);
+"""
+
+MISSION_STATE_SQL = """
+CREATE TABLE IF NOT EXISTS missions (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    description TEXT,
+    status TEXT NOT NULL,
+    created_by_session_id TEXT,
+    approved_by_session_id TEXT,
+    activated_by_session_id TEXT,
+    metadata_json TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    approved_at REAL,
+    activated_at REAL
+ );
+CREATE INDEX IF NOT EXISTS idx_missions_status ON missions(status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_missions_created_by ON missions(created_by_session_id);
+
+CREATE TABLE IF NOT EXISTS mission_nodes (
+    id TEXT PRIMARY KEY,
+    mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+    parent_node_id TEXT REFERENCES mission_nodes(id) ON DELETE CASCADE,
+    external_id TEXT,
+    node_type TEXT NOT NULL,
+    title TEXT NOT NULL,
+    body TEXT,
+    status TEXT NOT NULL,
+    position INTEGER NOT NULL DEFAULT 0,
+    metadata_json TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+ );
+CREATE INDEX IF NOT EXISTS idx_mission_nodes_mission_pos ON mission_nodes(mission_id, position, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_mission_nodes_external ON mission_nodes(mission_id, external_id) WHERE external_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS mission_links (
+    id TEXT PRIMARY KEY,
+    mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+    source_node_id TEXT NOT NULL REFERENCES mission_nodes(id) ON DELETE CASCADE,
+    target_node_id TEXT NOT NULL REFERENCES mission_nodes(id) ON DELETE CASCADE,
+    link_type TEXT NOT NULL,
+    metadata_json TEXT,
+    created_at REAL NOT NULL
+ );
+CREATE INDEX IF NOT EXISTS idx_mission_links_mission ON mission_links(mission_id, created_at);
+
+CREATE TABLE IF NOT EXISTS handoff_packets (
+    id TEXT PRIMARY KEY,
+    mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+    from_session_id TEXT,
+    to_session_id TEXT,
+    child_session_id TEXT,
+    goal TEXT NOT NULL,
+    context TEXT,
+    summary TEXT,
+    status TEXT NOT NULL,
+    metadata_json TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+ );
+CREATE INDEX IF NOT EXISTS idx_handoff_packets_mission ON handoff_packets(mission_id, created_at);
+
+CREATE TABLE IF NOT EXISTS mission_checkpoints (
+    id TEXT PRIMARY KEY,
+    mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+    session_id TEXT,
+    checkpoint_type TEXT NOT NULL,
+    title TEXT,
+    payload_json TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+ );
+CREATE INDEX IF NOT EXISTS idx_mission_checkpoints_mission ON mission_checkpoints(mission_id, checkpoint_type, created_at);
 """
 
 FTS_SQL = """
@@ -254,7 +358,8 @@ class SessionDB:
         cursor = self._conn.cursor()
 
         cursor.executescript(SCHEMA_SQL)
-
+        cursor.executescript(RUNTIME_SIGNAL_AUDIT_SQL)
+        cursor.executescript(MISSION_STATE_SQL)
         # Check schema version and run migrations
         cursor.execute("SELECT version FROM schema_version LIMIT 1")
         row = cursor.fetchone()
@@ -277,11 +382,12 @@ class SessionDB:
                     pass  # Column already exists
                 cursor.execute("UPDATE schema_version SET version = 3")
             if current_version < 4:
-                # v4: add unique index on title (NULLs allowed, only non-NULL must be unique)
+                # v4: replace the old global title index with per-user/source scoping.
                 try:
+                    cursor.execute("DROP INDEX IF EXISTS idx_sessions_title_unique")
                     cursor.execute(
-                        "CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_title_unique "
-                        "ON sessions(title) WHERE title IS NOT NULL"
+                        "CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_title_scoped "
+                        "ON sessions(source, COALESCE(user_id, ''), title) WHERE title IS NOT NULL"
                     )
                 except sqlite3.OperationalError:
                     pass  # Index already exists
@@ -330,14 +436,50 @@ class SessionDB:
                         pass  # Column already exists
                 cursor.execute("UPDATE schema_version SET version = 6")
 
-        # Unique title index — always ensure it exists (safe to run after migrations
-        # since the title column is guaranteed to exist at this point)
+            if current_version < 7:
+                # v7: add bounded runtime-signal audit storage for later runtime
+                # hook and projection integration. Delivery remains at-least-once;
+                # audit rows are observational, not authoritative domain truth.
+                cursor.executescript(RUNTIME_SIGNAL_AUDIT_SQL)
+                cursor.execute("UPDATE schema_version SET version = 7")
+
+            if current_version < 8:
+                # v8: add canonical mission state, handoff/checkpoint records, and
+                # per-session mission/todo attachment metadata for the Phase 2
+                # mission authority cutover.
+                for col_name, col_type in [
+                    ("attached_mission_id", "TEXT"),
+                    ("local_todo_state", "TEXT"),
+                ]:
+                    try:
+                        safe = col_name.replace('"', '""')
+                        cursor.execute(
+                            f'ALTER TABLE sessions ADD COLUMN "{safe}" {col_type}'
+                        )
+                    except sqlite3.OperationalError:
+                        pass
+                cursor.executescript(MISSION_STATE_SQL)
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_sessions_attached_mission ON sessions(attached_mission_id)"
+                )
+                cursor.execute("UPDATE schema_version SET version = 8")
+
         try:
             cursor.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_title_unique "
-                "ON sessions(title) WHERE title IS NOT NULL"
+                "CREATE INDEX IF NOT EXISTS idx_sessions_attached_mission ON sessions(attached_mission_id)"
             )
         except sqlite3.OperationalError:
+            pass
+
+        # Scoped title index — titles are unique only within the same source/user namespace.
+        try:
+            cursor.execute("DROP INDEX IF EXISTS idx_sessions_title_unique")
+            cursor.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_title_scoped "
+                "ON sessions(source, COALESCE(user_id, ''), title) WHERE title IS NOT NULL"
+            )
+        except sqlite3.OperationalError:
+            pass  # Index already exists
             pass  # Index already exists
 
         # FTS5 setup (separate because CREATE VIRTUAL TABLE can't be in executescript with IF NOT EXISTS reliably)
@@ -504,6 +646,7 @@ class SessionDB:
         session_id: str,
         source: str = "unknown",
         model: str = None,
+        user_id: str = None,
     ) -> None:
         """Ensure a session row exists, creating it with minimal metadata if absent.
 
@@ -514,9 +657,9 @@ class SessionDB:
         def _do(conn):
             conn.execute(
                 """INSERT OR IGNORE INTO sessions
-                   (id, source, model, started_at)
-                   VALUES (?, ?, ?, ?)""",
-                (session_id, source, model, time.time()),
+                   (id, source, user_id, model, started_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (session_id, source, user_id, model, time.time()),
             )
         self._execute_write(_do)
 
@@ -613,17 +756,22 @@ class SessionDB:
         """
         title = self.sanitize_title(title)
         def _do(conn):
+            cursor = conn.execute(
+                "SELECT source, user_id FROM sessions WHERE id = ?",
+                (session_id,),
+            )
+            current = cursor.fetchone()
+            if not current:
+                return 0
             if title:
-                # Check uniqueness (allow the same session to keep its own title)
+                # Check uniqueness within the same source/user namespace.
                 cursor = conn.execute(
-                    "SELECT id FROM sessions WHERE title = ? AND id != ?",
-                    (title, session_id),
+                    "SELECT id FROM sessions WHERE title = ? AND id != ? AND source = ? AND ((user_id IS NULL AND ? IS NULL) OR user_id = ?)",
+                    (title, session_id, current["source"], current["user_id"], current["user_id"]),
                 )
                 conflict = cursor.fetchone()
                 if conflict:
-                    raise ValueError(
-                        f"Title '{title}' is already in use by session {conflict['id']}"
-                    )
+                    raise ValueError(f"Title '{title}' is already in use.")
             cursor = conn.execute(
                 "UPDATE sessions SET title = ? WHERE id = ?",
                 (title, session_id),
@@ -641,16 +789,29 @@ class SessionDB:
             row = cursor.fetchone()
         return row["title"] if row else None
 
-    def get_session_by_title(self, title: str) -> Optional[Dict[str, Any]]:
+    def get_session_by_title(self, title: str, user_id: str = None, source: str = None) -> Optional[Dict[str, Any]]:
         """Look up a session by exact title. Returns session dict or None."""
+        where = ["title = ?"]
+        params: list[Any] = [title]
+        if source is not None:
+            where.append("source = ?")
+            params.append(source)
+        if user_id is not None:
+            where.append("user_id = ?")
+            params.append(user_id)
         with self._lock:
             cursor = self._conn.execute(
-                "SELECT * FROM sessions WHERE title = ?", (title,)
+                f"SELECT * FROM sessions WHERE {' AND '.join(where)} ORDER BY started_at DESC",
+                params,
             )
-            row = cursor.fetchone()
-        return dict(row) if row else None
+            rows = cursor.fetchall()
+        if not rows:
+            return None
+        if user_id is None and source is None and len(rows) > 1:
+            return None
+        return dict(rows[0])
 
-    def resolve_session_by_title(self, title: str) -> Optional[str]:
+    def resolve_session_by_title(self, title: str, user_id: str = None, source: str = None) -> Optional[str]:
         """Resolve a title to a session ID, preferring the latest in a lineage.
 
         If the exact title exists, returns that session's ID.
@@ -659,16 +820,24 @@ class SessionDB:
         latest numbered variant (the most recent continuation).
         """
         # First try exact match
-        exact = self.get_session_by_title(title)
+        exact = self.get_session_by_title(title, user_id=user_id, source=source)
 
         # Also search for numbered variants: "title #2", "title #3", etc.
         # Escape SQL LIKE wildcards (%, _) in the title to prevent false matches
         escaped = title.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        where = ["title LIKE ? ESCAPE '\\'"]
+        params: list[Any] = [f"{escaped} #%"]
+        if source is not None:
+            where.append("source = ?")
+            params.append(source)
+        if user_id is not None:
+            where.append("user_id = ?")
+            params.append(user_id)
         with self._lock:
             cursor = self._conn.execute(
                 "SELECT id, title, started_at FROM sessions "
-                "WHERE title LIKE ? ESCAPE '\\' ORDER BY started_at DESC",
-                (f"{escaped} #%",),
+                f"WHERE {' AND '.join(where)} ORDER BY started_at DESC",
+                params,
             )
             numbered = cursor.fetchall()
 
@@ -679,39 +848,46 @@ class SessionDB:
             return exact["id"]
         return None
 
-    def get_next_title_in_lineage(self, base_title: str) -> str:
+    def get_next_title_in_lineage(
+        self,
+        base_title: str,
+        *,
+        source: str = None,
+        user_id: str = None,
+    ) -> str:
         """Generate the next title in a lineage (e.g., "my session" → "my session #2").
 
         Strips any existing " #N" suffix to find the base name, then finds
-        the highest existing number and increments.
+        the highest existing number and increments within the same source/user namespace.
         """
-        # Strip existing #N suffix to find the true base
         match = re.match(r'^(.*?) #(\d+)$', base_title)
-        if match:
-            base = match.group(1)
-        else:
-            base = base_title
+        base = match.group(1) if match else base_title
 
-        # Find all existing numbered variants
-        # Escape SQL LIKE wildcards (%, _) in the base to prevent false matches
         escaped = base.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        where = ["(title = ? OR title LIKE ? ESCAPE '\\')"]
+        params: list[Any] = [base, f"{escaped} #%"]
+        if source is not None:
+            where.append("source = ?")
+            params.append(source)
+        if user_id is not None:
+            where.append("user_id = ?")
+            params.append(user_id)
         with self._lock:
             cursor = self._conn.execute(
-                "SELECT title FROM sessions WHERE title = ? OR title LIKE ? ESCAPE '\\'",
-                (base, f"{escaped} #%"),
+                f"SELECT title FROM sessions WHERE {' AND '.join(where)}",
+                params,
             )
-            existing = [row["title"] for row in cursor.fetchall()]
+            titles = [row["title"] for row in cursor.fetchall() if row["title"]]
 
-        if not existing:
-            return base  # No conflict, use the base name as-is
+        if not titles:
+            return base
 
-        # Find the highest number
-        max_num = 1  # The unnumbered original counts as #1
-        for t in existing:
-            m = re.match(r'^.* #(\d+)$', t)
+        max_num = 1 if base in titles else 0
+        pattern = re.compile(rf'^{re.escape(base)} #(\d+)$')
+        for title in titles:
+            m = pattern.match(title)
             if m:
                 max_num = max(max_num, int(m.group(1)))
-
         return f"{base} #{max_num + 1}"
 
     def list_sessions_rich(
@@ -721,6 +897,7 @@ class SessionDB:
         limit: int = 20,
         offset: int = 0,
         include_children: bool = False,
+        user_id: str = None,
     ) -> List[Dict[str, Any]]:
         """List sessions with preview (first user message) and last active timestamp.
 
@@ -746,7 +923,9 @@ class SessionDB:
             placeholders = ",".join("?" for _ in exclude_sources)
             where_clauses.append(f"s.source NOT IN ({placeholders})")
             params.extend(exclude_sources)
-
+        if user_id is not None:
+            where_clauses.append("s.user_id = ?")
+            params.append(user_id)
         where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
         query = f"""
             SELECT s.*,
@@ -930,6 +1109,139 @@ class SessionDB:
             messages.append(msg)
         return messages
 
+    @staticmethod
+    def _decode_json_column(raw: Optional[str]) -> Any:
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            logger.warning("Failed to deserialize JSON column in SessionDB")
+            return None
+
+    def _runtime_signal_row_to_dict(self, row: sqlite3.Row) -> Dict[str, Any]:
+        return {
+            "audit_id": row["audit_id"],
+            "event_id": row["event_id"],
+            "idempotency_key": row["idempotency_key"],
+            "event_type": row["event_type"],
+            "phase": row["phase"],
+            "occurred_at": row["occurred_at"],
+            "publisher": row["publisher"],
+            "session_id": row["session_id"],
+            "mission_id": row["mission_id"],
+            "correlation_id": row["correlation_id"],
+            "sequence_no": row["sequence_no"],
+            "actor": self._decode_json_column(row["actor_json"]),
+            "subject": self._decode_json_column(row["subject_json"]),
+            "provenance": row["provenance"],
+            "payload": self._decode_json_column(row["payload_json"]),
+            "payload_bytes": row["payload_bytes"],
+            "created_at": row["created_at"],
+        }
+
+    def append_runtime_signal_audit(self, signal: RuntimeSignal | Dict[str, Any]) -> int:
+        """Persist one runtime-signal audit row and return its audit ID."""
+        envelope = signal if isinstance(signal, RuntimeSignal) else RuntimeSignal.from_dict(signal)
+        actor_json = json.dumps(envelope.actor.to_dict(), ensure_ascii=False, separators=(",", ":")) if envelope.actor else None
+        subject_json = json.dumps(envelope.subject.to_dict(), ensure_ascii=False, separators=(",", ":")) if envelope.subject else None
+        payload_json = json.dumps(envelope.payload, ensure_ascii=False, separators=(",", ":")) if envelope.payload is not None else None
+        payload_bytes = len(payload_json.encode("utf-8")) if payload_json else 0
+
+        def _do(conn):
+            cursor = conn.execute(
+                """INSERT OR IGNORE INTO runtime_signal_audit (
+                   event_id, idempotency_key, event_type, phase, occurred_at, publisher,
+                   session_id, mission_id, correlation_id, sequence_no, actor_json,
+                   subject_json, provenance, payload_json, payload_bytes, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    envelope.event_id,
+                    envelope.idempotency_key,
+                    envelope.event_type,
+                    envelope.phase,
+                    envelope.occurred_at,
+                    envelope.publisher,
+                    envelope.session_id,
+                    envelope.mission_id,
+                    envelope.correlation_id,
+                    envelope.sequence_no,
+                    actor_json,
+                    subject_json,
+                    envelope.provenance,
+                    payload_json,
+                    payload_bytes,
+                    time.time(),
+                ),
+            )
+            if cursor.rowcount == 0:
+                existing = conn.execute(
+                    "SELECT id FROM runtime_signal_audit WHERE event_id = ?",
+                    (envelope.event_id,),
+                ).fetchone()
+                return existing["id"] if existing else 0
+            return cursor.lastrowid
+
+        return self._execute_write(_do)
+
+    def get_runtime_signal_audit(self, audit_id: int) -> Optional[Dict[str, Any]]:
+        """Load a persisted runtime-signal audit row by its integer ID."""
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT
+                   id AS audit_id, event_id, idempotency_key, event_type, phase,
+                   occurred_at, publisher, session_id, mission_id, correlation_id,
+                   sequence_no, actor_json, subject_json, provenance, payload_json,
+                   payload_bytes, created_at
+                   FROM runtime_signal_audit WHERE id = ?""",
+                (audit_id,),
+            ).fetchone()
+        return self._runtime_signal_row_to_dict(row) if row else None
+
+    def list_runtime_signal_audit(
+        self,
+        *,
+        session_id: str | None = None,
+        event_type_prefix: str | None = None,
+        correlation_id: str | None = None,
+        after_audit_id: int | None = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """List runtime-signal audit rows in durable insertion order."""
+        where_clauses: list[str] = []
+        params: list[Any] = []
+        if session_id is not None:
+            where_clauses.append("session_id = ?")
+            params.append(session_id)
+        if event_type_prefix is not None:
+            where_clauses.append("event_type LIKE ?")
+            params.append(f"{event_type_prefix}%")
+        if correlation_id is not None:
+            where_clauses.append("correlation_id = ?")
+            params.append(correlation_id)
+        if after_audit_id is not None:
+            where_clauses.append("id > ?")
+            params.append(after_audit_id)
+
+        where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+        params.append(limit)
+
+        with self._lock:
+            rows = self._conn.execute(
+                f"""SELECT
+                    id AS audit_id, event_id, idempotency_key, event_type, phase,
+                    occurred_at, publisher, session_id, mission_id, correlation_id,
+                    sequence_no, actor_json, subject_json, provenance, payload_json,
+                    payload_bytes, created_at
+                    FROM runtime_signal_audit
+                    {where_sql}
+                    ORDER BY id ASC
+                    LIMIT ?""",
+                params,
+            ).fetchall()
+        return [self._runtime_signal_row_to_dict(row) for row in rows]
+
+
     # =========================================================================
     # Search
     # =========================================================================
@@ -1011,6 +1323,7 @@ class SessionDB:
         role_filter: List[str] = None,
         limit: int = 20,
         offset: int = 0,
+        user_id: str = None,
     ) -> List[Dict[str, Any]]:
         """
         Full-text search across session messages using FTS5.
@@ -1049,7 +1362,9 @@ class SessionDB:
             role_placeholders = ",".join("?" for _ in role_filter)
             where_clauses.append(f"m.role IN ({role_placeholders})")
             params.extend(role_filter)
-
+        if user_id is not None:
+            where_clauses.append("s.user_id = ?")
+            params.append(user_id)
         where_sql = " AND ".join(where_clauses)
         params.extend([limit, offset])
 
@@ -1100,6 +1415,9 @@ class SessionDB:
             if role_filter:
                 like_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
                 like_params.extend(role_filter)
+            if user_id is not None:
+                like_where.append("s.user_id = ?")
+                like_params.append(user_id)
             like_sql = f"""
                 SELECT m.id, m.session_id, m.role,
                        substr(m.content,
@@ -1236,10 +1554,12 @@ class SessionDB:
         """
         def _do(conn):
             cursor = conn.execute(
-                "SELECT COUNT(*) FROM sessions WHERE id = ?", (session_id,)
+                "SELECT attached_mission_id FROM sessions WHERE id = ?", (session_id,)
             )
-            if cursor.fetchone()[0] == 0:
+            row = cursor.fetchone()
+            if row is None:
                 return False
+            attached_mission_id = row["attached_mission_id"]
             # Orphan child sessions so FK constraint is satisfied
             conn.execute(
                 "UPDATE sessions SET parent_session_id = NULL "
@@ -1247,7 +1567,18 @@ class SessionDB:
                 (session_id,),
             )
             conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM runtime_signal_audit WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+            if attached_mission_id:
+                remaining = conn.execute(
+                    "SELECT 1 FROM sessions WHERE attached_mission_id = ? LIMIT 1",
+                    (attached_mission_id,),
+                ).fetchone()
+                if remaining is None:
+                    conn.execute(
+                        "UPDATE missions SET status = ?, updated_at = ? WHERE id = ? AND status = ?",
+                        ("approved", time.time(), attached_mission_id, "active"),
+                    )
             return True
         return self._execute_write(_do)
 
@@ -1263,19 +1594,22 @@ class SessionDB:
         def _do(conn):
             if source:
                 cursor = conn.execute(
-                    """SELECT id FROM sessions
+                    """SELECT id, attached_mission_id FROM sessions
                        WHERE started_at < ? AND ended_at IS NOT NULL AND source = ?""",
                     (cutoff, source),
                 )
             else:
                 cursor = conn.execute(
-                    "SELECT id FROM sessions WHERE started_at < ? AND ended_at IS NOT NULL",
+                    "SELECT id, attached_mission_id FROM sessions WHERE started_at < ? AND ended_at IS NOT NULL",
                     (cutoff,),
                 )
-            session_ids = set(row["id"] for row in cursor.fetchall())
+            rows = cursor.fetchall()
+            session_ids = {row["id"] for row in rows}
 
             if not session_ids:
                 return 0
+
+            mission_ids = {row["attached_mission_id"] for row in rows if row["attached_mission_id"]}
 
             # Orphan any sessions whose parent is about to be deleted
             placeholders = ",".join("?" * len(session_ids))
@@ -1287,7 +1621,19 @@ class SessionDB:
 
             for sid in session_ids:
                 conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
+                conn.execute("DELETE FROM runtime_signal_audit WHERE session_id = ?", (sid,))
                 conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
+
+            for mission_id in mission_ids:
+                remaining = conn.execute(
+                    "SELECT 1 FROM sessions WHERE attached_mission_id = ? LIMIT 1",
+                    (mission_id,),
+                ).fetchone()
+                if remaining is None:
+                    conn.execute(
+                        "UPDATE missions SET status = ?, updated_at = ? WHERE id = ? AND status = ?",
+                        ("approved", time.time(), mission_id, "active"),
+                    )
             return len(session_ids)
 
         return self._execute_write(_do)

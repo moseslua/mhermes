@@ -26,7 +26,7 @@ For this turn, you are planning only.
 
 ## Output requirements
 
-Write a markdown plan that is concrete and actionable.
+Write a markdown plan that is concrete, actionable, and reviewable.
 
 Include, when relevant:
 - Goal
@@ -34,10 +34,34 @@ Include, when relevant:
 - Proposed approach
 - Step-by-step plan
 - Files likely to change
-- Tests / validation
+- Stable interfaces or contracts touched
+- Acceptance criteria (testable and observable)
+- Deterministic tests / validation
+- Edge cases and degraded-mode expectations
+- Eval tier (`none`, targeted deterministic tests, focused integration checks, or a heavier benchmark/eval run)
 - Risks, tradeoffs, and open questions
 
-If the task is code-related, include exact file paths, likely test targets, and verification steps.
+If the task is code-related, include exact file paths, likely test targets, and verification steps. Prefer explicit contract and evidence sections over vague implementation prose.
+
+## Contract and evidence
+
+For non-trivial work, the plan should make these boundaries explicit:
+
+```markdown
+## Contract and Evidence
+- In scope:
+- Out of scope:
+- Stable interfaces touched:
+- Acceptance criteria:
+- Data integrity assumptions:
+- Failure behavior:
+- Rollout / rollback:
+- Deterministic tests:
+- Edge cases:
+- Eval tier: none | targeted tests | focused integration checks | repo-specific benchmark/eval, if any
+```
+
+When the change touches prompts, memory, skills, or long-running context management, note whether the proposal affects stable base instructions or can stay in docs, skills, or other task-specific guidance instead.
 
 ## Save location
 

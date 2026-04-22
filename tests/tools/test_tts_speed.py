@@ -5,6 +5,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from gateway.session_context import restore_session_vars, set_session_vars
+
 
 @pytest.fixture(autouse=True)
 def clean_env(monkeypatch):
@@ -107,6 +109,30 @@ class TestOpenaiTtsSpeed:
         create = self._run({"speed": 10.0}, tmp_path, monkeypatch)
         kwargs = create.call_args[1]
         assert kwargs["speed"] == 4.0
+
+
+class TestTextToSpeechCronGuards:
+    def test_cron_session_rejects_custom_output_path(self, tmp_path):
+        from tools.tts_tool import text_to_speech_tool
+
+        tokens = set_session_vars(cron_session="1")
+        try:
+            result = text_to_speech_tool("hello", output_path=str(tmp_path / "out.mp3"))
+        finally:
+            restore_session_vars(tokens)
+
+        assert "Custom output_path is not allowed in agent sessions" in result
+
+    def test_gateway_session_rejects_custom_output_path(self, tmp_path):
+        from tools.tts_tool import text_to_speech_tool
+
+        tokens = set_session_vars(platform="telegram", chat_id="123")
+        try:
+            result = text_to_speech_tool("hello", output_path=str(tmp_path / "out.mp3"))
+        finally:
+            restore_session_vars(tokens)
+
+        assert "Custom output_path is not allowed in agent sessions" in result
 
 
 # ---------------------------------------------------------------------------

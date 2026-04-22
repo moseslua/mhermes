@@ -252,9 +252,11 @@ def camofox_navigate(url: str, task_id: Optional[str] = None) -> str:
                 {"userId": session["user_id"], "url": url},
                 timeout=60,
             )
+        current_url = data.get("url", url)
+        session["current_url"] = current_url
         result = {
             "success": True,
-            "url": data.get("url", url),
+            "url": current_url,
             "title": data.get("title", ""),
         }
         vnc = get_vnc_url()
@@ -349,10 +351,13 @@ def camofox_click(ref: str, task_id: Optional[str] = None) -> str:
             f"/tabs/{session['tab_id']}/click",
             {"userId": session["user_id"], "ref": clean_ref},
         )
+        current_url = data.get("url", "")
+        if current_url:
+            session["current_url"] = current_url
         return json.dumps({
             "success": True,
             "clicked": clean_ref,
-            "url": data.get("url", ""),
+            "url": current_url,
         })
     except Exception as e:
         return tool_error(str(e), success=False)
@@ -407,7 +412,10 @@ def camofox_back(task_id: Optional[str] = None) -> str:
             f"/tabs/{session['tab_id']}/back",
             {"userId": session["user_id"]},
         )
-        return json.dumps({"success": True, "url": data.get("url", "")})
+        current_url = data.get("url", "")
+        if current_url:
+            session["current_url"] = current_url
+        return json.dumps({"success": True, "url": current_url})
     except Exception as e:
         return tool_error(str(e), success=False)
 
@@ -512,6 +520,8 @@ def camofox_vision(question: str, annotate: bool = False,
 
         with open(screenshot_path, "wb") as f:
             f.write(resp.content)
+        from gateway.session_context import register_session_attachment_path
+        register_session_attachment_path(screenshot_path)
 
         # Encode for vision LLM
         img_b64 = base64.b64encode(resp.content).decode("utf-8")

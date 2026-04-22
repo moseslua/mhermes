@@ -46,6 +46,17 @@ class TestResolveCdpOverride:
         with patch("tools.browser_tool.requests.get", side_effect=RuntimeError("boom")):
             assert _resolve_cdp_override(HTTP_URL) == HTTP_URL
 
+    def test_falls_back_to_raw_url_when_websocket_missing(self):
+        from tools.browser_tool import _resolve_cdp_override
+
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"Browser": "Chrome"}
+
+        with patch("tools.browser_tool.requests.get", return_value=response):
+            assert _resolve_cdp_override(HTTP_URL) == HTTP_URL
+
+
     def test_normalizes_provider_returned_http_cdp_url_when_creating_session(self, monkeypatch):
         import tools.browser_tool as browser_tool
 

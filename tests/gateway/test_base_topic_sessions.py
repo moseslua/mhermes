@@ -8,6 +8,7 @@ import pytest
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, ProcessingOutcome, SendResult
 from gateway.session import SessionSource, build_session_key
+from gateway.session_context import restore_session_vars, set_session_vars
 
 
 class DummyTelegramAdapter(BasePlatformAdapter):
@@ -192,6 +193,52 @@ class TestBasePlatformTopicSessions:
             ("start", "1"),
             ("complete", "1", ProcessingOutcome.FAILURE),
         ]
+    @pytest.mark.asyncio
+    async def test_process_message_background_warns_when_text_and_attachment_diverge(self):
+        adapter = DummyTelegramAdapter()
+
+        async def handler(_event):
+            await asyncio.sleep(0)
+            return "Report ready.\nMEDIA:/tmp/not-registered.png"
+
+        adapter.set_message_handler(handler)
+        event = _make_event("-1001", "17585")
+        tokens = set_session_vars(platform="telegram", chat_id="-1001", thread_id="17585")
+        try:
+            await adapter._process_message_background(event, build_session_key(event.source))
+        finally:
+            restore_session_vars(tokens)
+
+        assert len(adapter.sent) == 1
+        assert "Report ready." in adapter.sent[0]["content"]
+        assert "blocked one or more file attachments" in adapter.sent[0]["content"]
+
+
+
+    @pytest.mark.asyncio
+    async def test_process_message_background_blocks_unregistered_media_paths(self):
+        adapter = DummyTelegramAdapter()
+
+        async def handler(_event):
+            await asyncio.sleep(0)
+            return "MEDIA:/tmp/not-registered.png"
+
+        adapter.set_message_handler(handler)
+        event = _make_event("-1001", "17585")
+        tokens = set_session_vars(platform="telegram", chat_id="-1001", thread_id="17585")
+        try:
+            await adapter._process_message_background(event, build_session_key(event.source))
+        finally:
+            restore_session_vars(tokens)
+        assert adapter.sent == [
+            {
+                "chat_id": "-1001",
+                "content": "⚠️ Hermes blocked one or more file attachments for safety. Regenerate the artifact in this session before trying to send it again.",
+                "reply_to": "1",
+                "metadata": {"thread_id": "17585"},
+            }
+        ]
+
 
     @pytest.mark.asyncio
     async def test_process_message_background_marks_cancellation_unsuccessful(self):

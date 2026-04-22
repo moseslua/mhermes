@@ -1288,3 +1288,66 @@ class TestDelegationReasoningEffort(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+class TestMissionLinkedDelegation(unittest.TestCase):
+    @patch("agent.handoff_packets.record_delegate_handoff")
+    @patch("tools.delegate_tool._run_single_child")
+    @patch("tools.delegate_tool._build_child_agent")
+    def test_persists_handoff_packets_for_attached_missions(self, mock_build_child, mock_run, mock_record):
+        child = MagicMock()
+        child.session_id = "child-session"
+        mock_build_child.return_value = child
+        mock_run.return_value = {
+            "task_index": 0,
+            "status": "completed",
+            "summary": "done",
+            "api_calls": 1,
+            "duration_seconds": 0.5,
+            "tool_trace": [],
+            "exit_reason": "completed",
+            "tokens": {"input": 0, "output": 0},
+        }
+        parent = _make_mock_parent()
+        parent.session_id = "parent-session"
+        parent._mission_service = MagicMock()
+        parent._mission_service.get_attached_mission_id.return_value = "mission-1"
+        parent._memory_manager = None
+
+        result = json.loads(delegate_task(goal="Investigate mission work", context="ctx", parent_agent=parent))
+
+        self.assertEqual(result["results"][0]["status"], "completed")
+        mock_record.assert_called_once()
+        _, kwargs = mock_record.call_args
+        self.assertEqual(kwargs["goal"], "Investigate mission work")
+        self.assertEqual(kwargs["parent_session_id"], "parent-session")
+        self.assertEqual(kwargs["child_session_id"], "child-session")
+
+    @patch("agent.handoff_packets.record_delegate_handoff", side_effect=RuntimeError("persist failed"))
+    @patch("tools.delegate_tool._run_single_child")
+    @patch("tools.delegate_tool._build_child_agent")
+    def test_handoff_persistence_failure_is_surfaced(self, mock_build_child, mock_run, _mock_record):
+        child = MagicMock()
+        child.session_id = "child-session"
+        mock_build_child.return_value = child
+        mock_run.return_value = {
+            "task_index": 0,
+            "status": "completed",
+            "summary": "done",
+            "api_calls": 1,
+            "duration_seconds": 0.5,
+            "tool_trace": [],
+            "exit_reason": "completed",
+            "tokens": {"input": 0, "output": 0},
+        }
+        parent = _make_mock_parent()
+        parent.session_id = "parent-session"
+        parent._mission_service = MagicMock()
+        parent._mission_service.get_attached_mission_id.return_value = "mission-1"
+        parent._memory_manager = None
+
+        result = json.loads(delegate_task(goal="Investigate mission work", context="ctx", parent_agent=parent))
+
+        assert result["results"][0]["status"] == "error"
+        assert "persist failed" in result["results"][0]["error"]

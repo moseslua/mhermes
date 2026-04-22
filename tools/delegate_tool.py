@@ -902,6 +902,33 @@ def delegate_task(
             except Exception:
                 pass
 
+    mission_service = getattr(parent_agent, "_mission_service", None) if parent_agent else None
+    parent_session_id = getattr(parent_agent, "session_id", None) if parent_agent else None
+    mission_id = None
+    if mission_service is not None and parent_session_id:
+        try:
+            mission_id = mission_service.get_attached_mission_id(parent_session_id)
+        except Exception:
+            mission_id = None
+    if mission_service is not None and mission_id:
+        from agent.handoff_packets import record_delegate_handoff
+        for entry in results:
+            child_session_id = getattr(children[entry["task_index"]][2], "session_id", "") if entry["task_index"] < len(children) else None
+            task_meta = task_list[entry["task_index"]] if entry["task_index"] < len(task_list) else {}
+            try:
+                record_delegate_handoff(
+                    mission_service,
+                    mission_id,
+                    goal=task_meta.get("goal", ""),
+                    context=task_meta.get("context"),
+                    parent_session_id=parent_session_id,
+                    child_session_id=child_session_id,
+                    result=entry,
+                )
+            except Exception as exc:
+                entry["status"] = "error"
+                entry["error"] = f"Failed to persist mission handoff packet: {exc}"
+
     total_duration = round(time.monotonic() - overall_start, 2)
 
     return json.dumps({

@@ -28,6 +28,7 @@ Usage in run_agent.py:
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import re
@@ -151,6 +152,20 @@ class MemoryManager:
             if p.name == name:
                 return p
         return None
+
+    def get_provider_status(self) -> Dict[str, Any]:
+        """Return read-only provider registration status for shared-memory reads."""
+        provider_names = [provider.name for provider in self._providers]
+        external_names = [name for name in provider_names if name != "builtin"]
+        return {
+            "active": bool(provider_names),
+            "provider_count": len(provider_names),
+            "provider_names": provider_names,
+            "external_provider_name": external_names[0] if external_names else None,
+            "external_provider_count": len(external_names),
+            "has_external_provider": self._has_external,
+        }
+
 
     # -- System prompt -------------------------------------------------------
 
@@ -312,16 +327,39 @@ class MemoryManager:
                 )
         return "\n\n".join(parts)
 
-    def on_memory_write(self, action: str, target: str, content: str) -> None:
+    def on_memory_write(
+        self,
+        action: str,
+        target: str,
+        content: str,
+        *,
+        old_text: str | None = None,
+        current_state: List[str] | None = None,
+    ) -> None:
         """Notify external providers when the built-in memory tool writes.
 
         Skips the builtin provider itself (it's the source of the write).
+        Providers that support richer mirroring can consume ``old_text`` and the
+        canonical post-write ``current_state``; older providers fall back to the
+        legacy three-argument contract.
         """
         for provider in self._providers:
             if provider.name == "builtin":
                 continue
             try:
-                provider.on_memory_write(action, target, content)
+                params = inspect.signature(provider.on_memory_write).parameters.values()
+                supports_kwargs = any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params)
+                keyword_names = {param.name for param in params}
+                if supports_kwargs or {"old_text", "current_state"} <= keyword_names:
+                    provider.on_memory_write(
+                        action,
+                        target,
+                        content,
+                        old_text=old_text,
+                        current_state=current_state,
+                    )
+                else:
+                    provider.on_memory_write(action, target, content)
             except Exception as e:
                 logger.debug(
                     "Memory provider '%s' on_memory_write failed: %s",

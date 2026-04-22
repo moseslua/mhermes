@@ -206,6 +206,7 @@ class TestRunBackgroundTask:
         mock_adapter.send = AsyncMock()
         mock_adapter.extract_media = MagicMock(return_value=([], "Hello from background!"))
         mock_adapter.extract_images = MagicMock(return_value=([], "Hello from background!"))
+        mock_adapter.extract_local_files = MagicMock(return_value=([], "Hello from background!"))
         runner.adapters[Platform.TELEGRAM] = mock_adapter
 
         source = SessionSource(
@@ -264,6 +265,83 @@ class TestRunBackgroundTask:
         mock_adapter.send.assert_called_once()
         mock_agent_instance.shutdown_memory_provider.assert_called_once()
         mock_agent_instance.close.assert_called_once()
+    @pytest.mark.asyncio
+    async def test_blocked_background_attachment_adds_visible_warning(self):
+        runner = _make_runner()
+        mock_adapter = AsyncMock()
+        mock_adapter.send = AsyncMock()
+        mock_adapter.extract_media = MagicMock(return_value=([("/tmp/not-registered.png", False)], "Report ready"))
+        mock_adapter.extract_images = MagicMock(return_value=([], "Report ready"))
+        mock_adapter.extract_local_files = MagicMock(return_value=([], "Report ready"))
+        runner.adapters[Platform.TELEGRAM] = mock_adapter
+
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id="12345",
+            chat_id="67890",
+            user_name="testuser",
+        )
+
+        with patch("gateway.run._load_gateway_config", return_value={}), \
+             patch.object(runner, "_resolve_session_agent_runtime", return_value=("test-model", {"api_key": "test-key"})), \
+             patch("gateway.run._platform_config_key", return_value="telegram"), \
+             patch("hermes_cli.tools_config._get_platform_tools", return_value=[]), \
+             patch.object(runner, "_resolve_turn_agent_config", return_value={"model": "test-model", "runtime": {"api_key": "test-key"}}), \
+             patch.object(runner, "_run_in_executor_with_context", return_value={"final_response": "Report ready\nMEDIA:/tmp/not-registered.png", "messages": []}):
+            await runner._run_background_task("say hello", source, "bg_test")
+
+        content = mock_adapter.send.call_args.kwargs.get("content") or mock_adapter.send.call_args.args[1]
+        assert "Report ready" in content
+        assert "blocked one or more file attachments" in content
+
+
+
+    @pytest.mark.asyncio
+    async def test_background_plain_local_path_adds_visible_warning(self):
+        runner = _make_runner()
+        mock_adapter = AsyncMock()
+        mock_adapter.send = AsyncMock()
+        mock_adapter.extract_media = MagicMock(return_value=([], "Report ready /tmp/not-registered.png"))
+        mock_adapter.extract_images = MagicMock(return_value=([], "Report ready /tmp/not-registered.png"))
+        mock_adapter.extract_local_files = MagicMock(return_value=(["/tmp/not-registered.png"], "Report ready"))
+        runner.adapters[Platform.TELEGRAM] = mock_adapter
+
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id="12345",
+            chat_id="67890",
+            user_name="testuser",
+        )
+
+        with patch("gateway.run._load_gateway_config", return_value={}), \
+             patch.object(runner, "_resolve_session_agent_runtime", return_value=("test-model", {"api_key": "test-key"})), \
+             patch("gateway.run._platform_config_key", return_value="telegram"), \
+             patch("hermes_cli.tools_config._get_platform_tools", return_value=[]), \
+             patch.object(runner, "_resolve_turn_agent_config", return_value={"model": "test-model", "runtime": {"api_key": "test-key"}}), \
+             patch.object(runner, "_run_in_executor_with_context", return_value={"final_response": "Report ready /tmp/not-registered.png", "messages": []}):
+            await runner._run_background_task("say hello", source, "bg_test")
+
+        content = mock_adapter.send.call_args.kwargs.get("content") or mock_adapter.send.call_args.args[1]
+        assert "Report ready" in content
+        assert "/tmp/not-registered.png" not in content
+        assert "blocked one or more file attachments" in content
+
+    @pytest.mark.asyncio
+    async def test_post_stream_blocked_attachment_sends_warning(self):
+        runner = _make_runner()
+        mock_adapter = AsyncMock()
+        mock_adapter.extract_media = MagicMock(return_value=([("/tmp/not-registered.png", False)], "Report ready"))
+        mock_adapter.extract_images = MagicMock(return_value=([], "Report ready"))
+        mock_adapter.extract_local_files = MagicMock(return_value=([], "Report ready"))
+        mock_adapter.send = AsyncMock()
+        event = _make_event(text="hello")
+
+        await runner._deliver_media_from_response("Report ready\nMEDIA:/tmp/not-registered.png", event, mock_adapter)
+
+        assert mock_adapter.send.await_count == 1
+        content = mock_adapter.send.call_args.kwargs.get("content") or mock_adapter.send.call_args.args[1]
+        assert "blocked one or more file attachments" in content
+
 
     @pytest.mark.asyncio
     async def test_exception_sends_error_message(self):

@@ -1,0 +1,1049 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HMAOM Architecture - Mermaid Diagrams</title>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <style>
+        :root {
+            --bg: #0a0e27;
+            --panel: #111530;
+            --accent: #6366f1;
+            --accent2: #8b5cf6;
+            --text: #e2e8f0;
+            --text2: #94a3b8;
+            --border: #1e293b;
+            --success: #22c55e;
+            --warning: #eab308;
+            --danger: #ef4444;
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            min-height: 100vh;
+            line-height: 1.6;
+        }
+
+        header {
+            background: linear-gradient(135deg, var(--panel) 0%, #1a1f4d 100%);
+            border-bottom: 1px solid var(--border);
+            padding: 2rem 3rem;
+            position: sticky;
+            top: 0;
+            z-index: 100;
+        }
+
+        header h1 {
+            font-size: 1.75rem;
+            font-weight: 700;
+            background: linear-gradient(90deg, var(--accent), var(--accent2));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        header p {
+            color: var(--text2);
+            margin-top: 0.25rem;
+            font-size: 0.9rem;
+        }
+
+        .nav-tabs {
+            display: flex;
+            gap: 0.5rem;
+            margin-top: 1.5rem;
+            flex-wrap: wrap;
+        }
+
+        .nav-tab {
+            padding: 0.6rem 1.25rem;
+            border-radius: 8px;
+            border: 1px solid var(--border);
+            background: rgba(99, 102, 241, 0.08);
+            color: var(--text2);
+            cursor: pointer;
+            font-size: 0.85rem;
+            font-weight: 500;
+            transition: all 0.2s ease;
+            user-select: none;
+        }
+
+        .nav-tab:hover {
+            background: rgba(99, 102, 241, 0.15);
+            color: var(--text);
+            border-color: var(--accent);
+        }
+
+        .nav-tab.active {
+            background: linear-gradient(135deg, var(--accent), var(--accent2));
+            color: white;
+            border-color: transparent;
+            box-shadow: 0 4px 15px rgba(99, 102, 241, 0.3);
+        }
+
+        .tab-content {
+            display: none;
+            padding: 2rem 3rem;
+            animation: fadeIn 0.3s ease;
+        }
+
+        .tab-content.active {
+            display: block;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .diagram-section {
+            background: var(--panel);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            overflow: hidden;
+            margin-bottom: 2rem;
+        }
+
+        .diagram-header {
+            padding: 1.25rem 2rem;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .diagram-header h2 {
+            font-size: 1.2rem;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+
+        .diagram-number {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 32px;
+            height: 32px;
+            border-radius: 8px;
+            background: linear-gradient(135deg, var(--accent), var(--accent2));
+            font-size: 0.85rem;
+            font-weight: 700;
+            color: white;
+        }
+
+        .diagram-meta {
+            font-size: 0.75rem;
+            color: var(--text2);
+        }
+
+        .mermaid-container {
+            padding: 2rem;
+            overflow-x: auto;
+            min-height: 600px;
+            display: flex;
+            justify-content: center;
+            align-items: flex-start;
+        }
+
+        .mermaid {
+            min-width: 100%;
+        }
+
+        .mermaid svg {
+            max-width: 100%;
+            height: auto;
+        }
+
+        .legend {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 0.75rem;
+            padding: 1.5rem 2rem;
+            border-top: 1px solid var(--border);
+            background: rgba(10, 14, 39, 0.5);
+        }
+
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-size: 0.8rem;
+            color: var(--text2);
+        }
+
+        .legend-dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 3px;
+            flex-shrink: 0;
+        }
+
+        .stats-bar {
+            display: flex;
+            gap: 2rem;
+            padding: 1rem 2rem;
+            border-top: 1px solid var(--border);
+            background: rgba(10, 14, 39, 0.3);
+        }
+
+        .stat {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-size: 0.8rem;
+            color: var(--text2);
+        }
+
+        .stat-value {
+            font-weight: 700;
+            color: var(--text);
+        }
+
+        /* Mermaid theme overrides */
+        .mermaid .node rect,
+        .mermaid .node circle,
+        .mermaid .node polygon,
+        .mermaid .node ellipse {
+            stroke-width: 2px !important;
+        }
+
+        .mermaid .edgeLabel {
+            background: var(--panel) !important;
+            color: var(--text) !important;
+            padding: 2px 6px !important;
+            border-radius: 4px !important;
+            font-size: 11px !important;
+        }
+
+        .mermaid .cluster rect {
+            stroke-width: 2px !important;
+            rx: 12 !important;
+            ry: 12 !important;
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>HMAOM Architecture Visualizations</h1>
+        <p>Hierarchical Multi-Agent Orchestration Mesh - Reference Specification</p>
+        <div class="nav-tabs">
+            <div class="nav-tab active" onclick="showTab(0)">01 System Architecture</div>
+            <div class="nav-tab" onclick="showTab(1)">02 Recursive Spawn Flow</div>
+            <div class="nav-tab" onclick="showTab(2)">03 Communication Protocol</div>
+            <div class="nav-tab" onclick="showTab(3)">04 Fault Tolerance</div>
+            <div class="nav-tab" onclick="showTab(4)">All Diagrams</div>
+        </div>
+    </header>
+
+    <!-- Tab 1: System Architecture -->
+    <div class="tab-content active" id="tab-0">
+        <div class="diagram-section">
+            <div class="diagram-header">
+                <h2><span class="diagram-number">1</span> System Architecture Overview</h2>
+                <span class="diagram-meta">Hub-and-spoke topology with gateway router</span>
+            </div>
+            <div class="mermaid-container">
+                <div class="mermaid">
+graph TB
+    subgraph USER_LAYER[" "]
+        USER([👤 User&lt;br/&gt;Any Channel])
+    end
+    subgraph GATEWAY["🔷 GATEWAY LAYER (Main Harness)"]
+        direction TB
+        CLASSIFIER["🧠 Intent Classifier&lt;br/&gt;SLM Router (&lt;50ms)&lt;br/&gt;Fallback LLM"]
+        ROUTER["🌐 Gateway Router&lt;br/&gt;SOUL.md&lt;br/&gt;Intent Classifier + Task Router&lt;br/&gt;Route Only — No Domain Logic"]
+    end
+    subgraph SPECIALISTS["🔶 SPECIALIST HARNESS LAYER"]
+        direction LR
+        subgraph FINANCE["💰 Finance Harness"]
+            F_SKILLS["📚 ~800 Skills"]
+            F_TOOLS["🔧 Domain Tools"]
+            F_MEM["🧠 Memory"]
+            F_SANDBOX["⬡ FUSE Sandbox"]
+            F_AGENT1["⚙️ explore"]
+            F_AGENT2["⚙️ calculate"]
+            F_AGENT3["⚙️ verify"]
+            F_AGENT4["⚙️ backtest"]
+        end
+        subgraph MATHS["📐 Maths Harness"]
+            M_SKILLS["📚 ~600 Skills"]
+            M_TOOLS["🔧 Domain Tools"]
+            M_MEM["🧠 Memory"]
+            M_SANDBOX["⬡ FUSE Sandbox"]
+            M_AGENT1["⚙️ explore"]
+            M_AGENT2["⚙️ calculate"]
+            M_AGENT3["⚙️ prove"]
+            M_AGENT4["⚙️ verify"]
+        end
+        subgraph PHYSICS["⚛️ Physics Harness"]
+            P_SKILLS["📚 ~500 Skills"]
+            P_TOOLS["🔧 Domain Tools"]
+            P_MEM["🧠 Memory"]
+            P_SANDBOX["⬡ FUSE Sandbox"]
+            P_AGENT1["⚙️ explore"]
+            P_AGENT2["⚙️ simulate"]
+            P_AGENT3["⚙️ calculate"]
+        end
+        subgraph CODE["💻 Code Harness"]
+            C_SKILLS["📚 ~1200 Skills"]
+            C_TOOLS["🔧 Domain Tools"]
+            C_MEM["🧠 Memory"]
+            C_SANDBOX["⬡ FUSE Sandbox"]
+            C_AGENT1["⚙️ plan"]
+            C_AGENT2["⚙️ implement"]
+            C_AGENT3["⚙️ review"]
+            C_AGENT4["⚙️ debug"]
+        end
+        subgraph RESEARCH["🔍 Research Harness"]
+            R_SKILLS["📚 ~400 Skills"]
+            R_TOOLS["🔧 Domain Tools"]
+            R_MEM["🧠 Memory"]
+            R_SANDBOX["⬡ FUSE Sandbox"]
+            R_AGENT1["⚙️ search"]
+            R_AGENT2["⚙️ extract"]
+            R_AGENT3["⚙️ summarize"]
+        end
+        subgraph REPORTER["📄 Reporter Harness"]
+            RP_SKILLS["📚 ~300 Skills"]
+            RP_TOOLS["🔧 Format Tools"]
+            RP_MEM["🧠 Memory"]
+            RP_SANDBOX["⬡ FUSE Sandbox"]
+            RP_AGENT1["⚙️ draft"]
+            RP_AGENT2["⚙️ review"]
+            RP_AGENT3["⚙️ synthesize"]
+            RP_DEBATE["⚙️ debate&lt;br/&gt;(Hermes)"]
+        end
+    end
+    subgraph SUBAGENT["🟣 RECURSIVE SUBAGENT LAYER&lt;br/&gt;Max Depth: 3"]
+        direction LR
+        subgraph RECURSION["Level 2→3 Spawn Tree"]
+            SUB1["⚡ Sub-Agent"]
+            SUB2["⚡ Sub-Agent"]
+            LEAF1["🍃 Leaf Agent&lt;br/&gt;NO FURTHER SPAWNING"]
+            LEAF2["🍃 Leaf Agent&lt;br/&gt;NO FURTHER SPAWNING"]
+            SUB1 --> LEAF1
+            SUB2 --> LEAF2
+        end
+    end
+    subgraph SYNTHESIS["🟢 SYNTHESIS LAYER"]
+        SYNTH["📝 Reporter Synthesis&lt;br/&gt;Cross-Domain Aggregation&lt;br/&gt;+ Debate Mode"]
+    end
+    subgraph OUTPUT["📤 OUTPUT"]
+        OUT([📋 Structured Result&lt;br/&gt;Schema-Validated])
+    end
+    subgraph OBSERVABILITY["👁️ OBSERVABILITY"]
+        TRACE["📡 Distributed Tracing&lt;br/&gt;Correlation IDs"]
+        BUDGET["💰 Budget Manager&lt;br/&gt;Tokens / Time / Cost"]
+        CIRCUIT["🔒 Circuit Breakers"]
+        DASHBOARD["📊 Agent Control Center"]
+    end
+    subgraph MESSAGEBUS["📬 MESSAGE BUS"]
+        direction TB
+        BUS["Redis / SQLite&lt;br/&gt;JSON Schema Enforced"]
+    end
+    USER --> CLASSIFIER
+    CLASSIFIER --> ROUTER
+    ROUTER -->|route: single| FINANCE
+    ROUTER -->|route: single| MATHS
+    ROUTER -->|route: single| PHYSICS
+    ROUTER -->|route: single| CODE
+    ROUTER -->|route: parallel| RESEARCH
+    ROUTER -->|route: adaptive| REPORTER
+    FINANCE -.->|spawn| SUBAGENT
+    MATHS -.->|spawn| SUBAGENT
+    PHYSICS -.->|spawn| SUBAGENT
+    CODE -.->|spawn| SUBAGENT
+    RESEARCH -.->|spawn| SUBAGENT
+    FINANCE -->|result| SYNTH
+    MATHS -->|result| SYNTH
+    PHYSICS -->|result| SYNTH
+    CODE -->|result| SYNTH
+    RESEARCH -->|result| SYNTH
+    REPORTER -->|result| SYNTH
+    SYNTH --> OUT
+    ROUTER -.->|log| TRACE
+    FINANCE -.->|log| TRACE
+    MATHS -.->|log| TRACE
+    PHYSICS -.->|log| TRACE
+    TRACE -.-> DASHBOARD
+    BUDGET -.-> DASHBOARD
+    CIRCUIT -.-> DASHBOARD
+    FINANCE -.->|publish| BUS
+    MATHS -.->|publish| BUS
+    PHYSICS -.->|publish| BUS
+    CODE -.->|publish| BUS
+    RESEARCH -.->|publish| BUS
+    REPORTER -.->|consume| BUS
+    SYNTH -.->|consume| BUS
+    style USER_LAYER fill:none,stroke:none
+    style USER fill:#e8f5e9,stroke:#2e7d32,stroke-width:3px
+    style GATEWAY fill:#e3f2fd,stroke:#1565c0,stroke-width:2px
+    style CLASSIFIER fill:#bbdefb,stroke:#1565c0
+    style ROUTER fill:#fff3e0,stroke:#e65100,stroke-width:3px
+    style SPECIALISTS fill:#f3e5f5,stroke:#6a1b9a,stroke-width:2px
+    style FINANCE fill:#fce4ec,stroke:#c62828
+    style MATHS fill:#e8eaf6,stroke:#283593
+    style PHYSICS fill:#e0f2f1,stroke:#00695c
+    style CODE fill:#fff8e1,stroke:#f57f17
+    style RESEARCH fill:#f1f8e9,stroke:#558b2f
+    style REPORTER fill:#efebe9,stroke:#4e342e
+    style SUBAGENT fill:#ede7f6,stroke:#4527a0,stroke-width:2px
+    style RECURSION fill:#d1c4e9,stroke:#311b92
+    style SUB1 fill:#b39ddb,stroke:#4527a0
+    style SUB2 fill:#b39ddb,stroke:#4527a0
+    style LEAF1 fill:#a5d6a7,stroke:#2e7d32
+    style LEAF2 fill:#a5d6a7,stroke:#2e7d32
+    style SYNTHESIS fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    style SYNTH fill:#c8e6c9,stroke:#2e7d32
+    style OUTPUT fill:none,stroke:none
+    style OUT fill:#b9f6ca,stroke:#00c853,stroke-width:3px
+    style OBSERVABILITY fill:#eceff1,stroke:#455a64,stroke-width:2px
+    style MESSAGEBUS fill:#fffde7,stroke:#f9a825,stroke-width:2px
+    style BUS fill:#fff9c4,stroke:#f57f17
+                </div>
+            </div>
+            <div class="legend">
+                <div class="legend-item"><div class="legend-dot" style="background:#fff3e0;border:2px solid #e65100"></div>Gateway Router (Intent + Route)</div>
+                <div class="legend-item"><div class="legend-dot" style="background:#fce4ec;border:2px solid #c62828"></div>Finance Specialist</div>
+                <div class="legend-item"><div class="legend-dot" style="background:#e8eaf6;border:2px solid #283593"></div>Maths Specialist</div>
+                <div class="legend-item"><div class="legend-dot" style="background:#e0f2f1;border:2px solid #00695c"></div>Physics Specialist</div>
+                <div class="legend-item"><div class="legend-dot" style="background:#fff8e1;border:2px solid #f57f17"></div>Code Specialist</div>
+                <div class="legend-item"><div class="legend-dot" style="background:#f1f8e9;border:2px solid #558b2f"></div>Research Specialist</div>
+                <div class="legend-item"><div class="legend-dot" style="background:#efebe9;border:2px solid #4e342e"></div>Reporter Specialist</div>
+                <div class="legend-item"><div class="legend-dot" style="background:#d1c4e9;border:2px solid #311b92"></div>Recursive Subagent Layer</div>
+                <div class="legend-item"><div class="legend-dot" style="background:#c8e6c9;border:2px solid #2e7d32"></div>Synthesis Layer</div>
+                <div class="legend-item"><div class="legend-dot" style="background:#fff9c4;border:2px solid #f57f17"></div>Message Bus</div>
+            </div>
+            <div class="stats-bar">
+                <div class="stat">Total Skills: <span class="stat-value">~4,000</span></div>
+                <div class="stat">Specialists: <span class="stat-value">6</span></div>
+                <div class="stat">Max Skills per Agent: <span class="stat-value">~1,200</span></div>
+                <div class="stat">Max Recursion Depth: <span class="stat-value">3</span></div>
+                <div class="stat">Message Types: <span class="stat-value">9</span></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Tab 2: Recursive Spawn Flow -->
+    <div class="tab-content" id="tab-1">
+        <div class="diagram-section">
+            <div class="diagram-header">
+                <h2><span class="diagram-number">2</span> Recursive Subagent Spawning Protocol</h2>
+                <span class="diagram-meta">Hierarchical spawn control with budget enforcement</span>
+            </div>
+            <div class="mermaid-container">
+                <div class="mermaid">
+graph TB
+    subgraph CONSTRAINTS["🔒 GLOBAL BUDGET (Root Request)"]
+        direction LR
+        B1["⏱️ 5 min wall time"]
+        B2["📄 100K token budget"]
+        B3["💰 $2.00 cost cap"]
+        B4["🔻 Max Depth: 3"]
+        B5["🔀 Max Breadth: 10"]
+    end
+    subgraph TREE["🌲 SPAWN TREE"]
+        direction TB
+        L0["🔷 Level 0: Gateway Router&lt;br/&gt;spawn(depth=3, budget=100K, $2.00, 5min)&lt;br/&gt;correlationId: req-abc-123"]
+        subgraph L1["Level 1 — Finance Specialist"]
+            L1_NODE["💰 Finance Harness&lt;br/&gt;depth=1&lt;br/&gt;budget allocated: 30K tokens"]
+            subgraph L1_AGENTS["Subagents"]
+                L1_A1["⚙️ explore-agent&lt;br/&gt;spawn(depth=2, budget=10K)"]
+                L1_A2["⚙️ calculate-agent&lt;br/&gt;spawn(depth=2, budget=10K)"]
+                L1_A3["⚙️ verify-agent&lt;br/&gt;no-spawn (sequential)"]
+            end
+        end
+        subgraph L2["Level 2 — Explore Subagent"]
+            L2_NODE["⚙️ explore-agent&lt;br/&gt;depth=2&lt;br/&gt;budget remaining: 10K tokens"]
+            subgraph L2_AGENTS["Subagents"]
+                L2_A1["⚙️ data-extraction&lt;br/&gt;spawn(depth=1, budget=5K)"]
+                L2_A2["⚙️ analysis-agent&lt;br/&gt;spawn(depth=1, budget=3K)"]
+            end
+        end
+        subgraph L3["Level 3 — Leaf Agents"]
+            direction LR
+            L3_A1["🍃 data-extraction-leaf&lt;br/&gt;depth=3 — MAX DEPTH&lt;br/&gt;⛔ NO FURTHER SPAWNING&lt;br/&gt;output: extracted_data[]"]
+            L3_A2["🍃 analysis-leaf&lt;br/&gt;depth=3 — MAX DEPTH&lt;br/&gt;⛔ NO FURTHER SPAWNING&lt;br/&gt;output: analysis_result{}"]
+            L3_A3["🍃 calc-leaf&lt;br/&gt;depth=3 — MAX DEPTH&lt;br/&gt;⛔ NO FURTHER SPAWNING&lt;br/&gt;output: calc_result{}"]
+        end
+        subgraph AGGREGATION["📦 Result Aggregation"]
+            AGG["🔄 Aggregate Results&lt;br/&gt;Tree Reduce Operation&lt;br/&gt;Tokens used: 2K / 5K"]
+        end
+    end
+    subgraph SYNTH["📝 SYNTHESIS"]
+        SYNTH_NODE["Reporter Harness&lt;br/&gt;Synthesize cross-domain results&lt;br/&gt;schema: StructuredReport"]
+    end
+    subgraph BUDGET_TRACKER["📊 REAL-TIME BUDGET TRACKER"]
+        direction TB
+        BT_GLOBAL["Global: 100K tokens | $2.00 | 5 min&lt;br/&gt;Used: 47K tokens | $0.89 | 2.1 min&lt;br/&gt;Status: ✅ UNDER BUDGET"]
+        BT_BRANCH1["Finance branch: 30K allocated&lt;br/&gt;Used: 18K | Remaining: 12K ✅"]
+        BT_BRANCH2["Explore branch: 10K allocated&lt;br/&gt;Used: 7K | Remaining: 3K ✅"]
+        BT_LEAF["Leaf: 5K allocated&lt;br/&gt;Used: 2K | Returned: 3K ✅"]
+    end
+    subgraph SAFETY["🛡️ SAFETY MECHANISMS"]
+        direction LR
+        STUCK["Stuck Detector&lt;br/&gt;No tool calls &gt; 30s → Kill"]
+        CB["Circuit Breaker&lt;br/&gt;5 failures → Open → Reroute"]
+        CP["Checkpoint Store&lt;br/&gt;Restore on failure"]
+    end
+    L0 -->|spawn(depth=3)| L1_NODE
+    L1_NODE -->|spawn(depth=2)| L1_A1
+    L1_NODE -->|spawn(depth=2)| L1_A2
+    L1_NODE -->|no-spawn| L1_A3
+    L1_A1 -->|spawn(depth=1)| L2_NODE
+    L2_NODE -->|spawn(depth=1)| L2_A1
+    L2_NODE -->|spawn(depth=1)| L2_A2
+    L2_A1 -->|leaf| L3_A1
+    L2_A2 -->|leaf| L3_A2
+    L1_A2 -->|leaf| L3_A3
+    L3_A1 -->|result| AGG
+    L3_A2 -->|result| AGG
+    L3_A3 -->|result| AGG
+    AGG -->|tree result| SYNTH_NODE
+    B1 -.->|enforce| L0
+    B2 -.->|enforce| TREE
+    B3 -.->|enforce| TREE
+    B4 -.->|enforce| L3_A1
+    B5 -.->|enforce| L1_AGENTS
+    BT_GLOBAL -.->|monitor| L0
+    BT_BRANCH1 -.->|monitor| L1_NODE
+    BT_BRANCH2 -.->|monitor| L2_NODE
+    BT_LEAF -.->|monitor| L3_A1
+    STUCK -.->|"kill branch"| L2_NODE
+    CB -.->|block| L1_NODE
+    CP -.->|resume| L2_A1
+    style CONSTRAINTS fill:#ffebee,stroke:#c62828,stroke-width:2px
+    style B1 fill:#ffcdd2,stroke:#c62828
+    style B2 fill:#ffcdd2,stroke:#c62828
+    style B3 fill:#ffcdd2,stroke:#c62828
+    style B4 fill:#ffcdd2,stroke:#c62828
+    style B5 fill:#ffcdd2,stroke:#c62828
+    style TREE fill:#e3f2fd,stroke:#1565c0,stroke-width:2px
+    style L0 fill:#fff3e0,stroke:#e65100,stroke-width:3px
+    style L1 fill:#fce4ec,stroke:#c62828
+    style L1_NODE fill:#f8bbd9,stroke:#c62828
+    style L1_AGENTS fill:#fce4ec,stroke:#ad1457
+    style L1_A1 fill:#f48fb1,stroke:#ad1457
+    style L1_A2 fill:#f48fb1,stroke:#ad1457
+    style L1_A3 fill:#f48fb1,stroke:#ad1457
+    style L2 fill:#ede7f6,stroke:#6a1b9a
+    style L2_NODE fill:#d1c4e9,stroke:#6a1b9a
+    style L2_AGENTS fill:#ede7f6,stroke:#7b1fa2
+    style L2_A1 fill:#b39ddb,stroke:#7b1fa2
+    style L2_A2 fill:#b39ddb,stroke:#7b1fa2
+    style L3 fill:#c8e6c9,stroke:#2e7d32,stroke-width:2px
+    style L3_A1 fill:#a5d6a7,stroke:#388e3c
+    style L3_A2 fill:#a5d6a7,stroke:#388e3c
+    style L3_A3 fill:#a5d6a7,stroke:#388e3c
+    style AGGREGATION fill:#fff9c4,stroke:#f9a825
+    style AGG fill:#fff59d,stroke:#f57f17,stroke-width:2px
+    style SYNTH fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    style SYNTH_NODE fill:#c8e6c9,stroke:#2e7d32
+    style BUDGET_TRACKER fill:#f1f8e9,stroke:#558b2f,stroke-width:2px
+    style BT_GLOBAL fill:#dcedc8,stroke:#558b2f
+    style BT_BRANCH1 fill:#f1f8e9,stroke:#7cb342
+    style BT_BRANCH2 fill:#f1f8e9,stroke:#7cb342
+    style BT_LEAF fill:#f1f8e9,stroke:#7cb342
+    style SAFETY fill:#eceff1,stroke:#455a64,stroke-width:2px
+    style STUCK fill:#cfd8dc,stroke:#546e7a
+    style CB fill:#cfd8dc,stroke:#546e7a
+    style CP fill:#cfd8dc,stroke:#546e7a
+                </div>
+            </div>
+            <div class="legend">
+                <div class="legend-item"><div class="legend-dot" style="background:#fff3e0;border:2px solid #e65100"></div>Gateway Router</div>
+                <div class="legend-item"><div class="legend-dot" style="background:#f8bbd9;border:2px solid #ad1457"></div>Level 1 — Specialist</div>
+                <div class="legend-item"><div class="legend-dot" style="background:#d1c4e9;border:2px solid #6a1b9a"></div>Level 2 — Subagent</div>
+                <div class="legend-item"><div class="legend-dot" style="background:#a5d6a7;border:2px solid #388e3c"></div>Level 3 — Leaf (Max Depth)</div>
+                <div class="legend-item"><div class="legend-dot" style="background:#fff59d;border:2px solid #f57f17"></div>Result Aggregation</div>
+                <div class="legend-item"><div class="legend-dot" style="background:#ffcdd2;border:2px solid #c62828"></div>Budget / Constraint</div>
+                <div class="legend-item"><div class="legend-dot" style="background:#dcedc8;border:2px solid #558b2f"></div>Budget Tracker</div>
+                <div class="legend-item"><div class="legend-dot" style="background:#cfd8dc;border:2px solid #546e7a"></div>Safety Mechanism</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Tab 3: Communication Protocol -->
+    <div class="tab-content" id="tab-2">
+        <div class="diagram-section">
+            <div class="diagram-header">
+                <h2><span class="diagram-number">3</span> Inter-Agent Communication Protocol</h2>
+                <span class="diagram-meta">Message bus, 4 communication levels, synthesis flow</span>
+            </div>
+            <div class="mermaid-container">
+                <div class="mermaid">
+graph LR
+    subgraph AGENTS["SPECIALIST AGENTS"]
+        direction TB
+        subgraph FINANCE["💰 Finance"]
+            F_CORE["⚙️ Agent Core&lt;br/&gt;Skills | Memory | Sandbox"]
+        end
+        subgraph MATHS["📐 Maths"]
+            M_CORE["⚙️ Agent Core&lt;br/&gt;Skills | Memory | Sandbox"]
+        end
+        subgraph PHYSICS["⚛️ Physics"]
+            P_CORE["⚙️ Agent Core&lt;br/&gt;Skills | Memory | Sandbox"]
+        end
+        subgraph CODE["💻 Code"]
+            C_CORE["⚙️ Agent Core&lt;br/&gt;Skills | Memory | Sandbox"]
+        end
+    end
+    subgraph BUS["📬 MESSAGE BUS&lt;br/&gt;(Redis / SQLite)&lt;br/&gt;JSON Schema Enforced"]
+        direction TB
+        MQ1["🔵 task_request /&lt;br/&gt;task_result"]
+        MQ2["🟠 partial_result&lt;br/&gt;(streaming)"]
+        MQ3["🟢 context_request /&lt;br/&gt;context_response"]
+        MQ4["🔴 error /&lt;br/&gt;checkpoint"]
+        MQ5["🟣 synthesis_request"]
+        MQ6["⚪ health_ping"]
+    end
+    subgraph PROTOCOL["📋 PROTOCOL SPEC"]
+        direction TB
+        PSPEC["json {&lt;br/&gt;  correlationId: 'req-abc-123',&lt;br/&gt;  sender: 'finance/agent-1',&lt;br/&gt;  recipient: 'synthesis',&lt;br/&gt;  type: 'task_result',&lt;br/&gt;  payload: { ... },&lt;br/&gt;  schema: 'ResultSchema-v1'&lt;br/&gt;}"]
+    end
+    subgraph SYNTHESIS["📝 SYNTHESIS LAYER"]
+        direction TB
+        SYNTH_CORE["📄 Reporter Agent&lt;br/&gt;Cross-Domain Aggregation"]
+        subgraph SYNTH_MODES["Synthesis Modes"]
+            SM1["🔀 unify&lt;br/&gt;Merge similar"]
+            SM2["⚖️ reconcile&lt;br/&gt;Resolve conflicts"]
+            SM3["⛓️ sequential&lt;br/&gt;Chain results"]
+            SM4["🗣️ debate&lt;br/&gt;Hermes adversarial"]
+        end
+        subgraph DEBATE["Debate Mode Detail"]
+            D_PROPONENT["✅ Proponent Agent&lt;br/&gt;Defends Result A"]
+            D_OPPONENT["❌ Opponent Agent&lt;br/&gt;Challenges, Defends B"]
+            D_JUDGE["⚖️ Judge Agent&lt;br/&gt;(Neutral) Decides"]
+        end
+    end
+    subgraph OUTPUT["📤 OUTPUT"]
+        OUT["📋 Validated JSON&lt;br/&gt;Schema-Compliant&lt;br/&gt;Citation-Traced"]
+    end
+    subgraph LEVELS["📶 COMMUNICATION LEVELS&lt;br/&gt;(Hermes-Inspired)"]
+        direction TB
+        L0["L0: Isolated 🔒&lt;br/&gt;No sharing&lt;br/&gt;Parent relays all"]
+        L1["L1: Result Passing 📤&lt;br/&gt;Auto-inject upstream&lt;br/&gt;Workflow DAGs"]
+        L2["L2: Shared Scratchpad 📝&lt;br/&gt;Read/write KV store&lt;br/&gt;Fine-grained sharing"]
+        L3["L3: Live Dialogue 💬&lt;br/&gt;Turn-based conversation&lt;br/&gt;Debate / Review"]
+    end
+    F_CORE -->|publish| MQ1
+    F_CORE -->|publish| MQ2
+    M_CORE -->|publish| MQ1
+    P_CORE -->|publish| MQ3
+    C_CORE -->|publish| MQ4
+    MQ1 -->|consume| SYNTH_CORE
+    MQ2 -->|stream| SYNTH_CORE
+    MQ3 -->|route| P_CORE
+    MQ4 -->|log| MQ6
+    MQ5 -->|trigger| SYNTH_CORE
+    SYNTH_CORE -->|mode: debate| D_PROPONENT
+    SYNTH_CORE -->|mode: debate| D_OPPONENT
+    D_PROPONENT -->|argue| D_JUDGE
+    D_OPPONENT -->|argue| D_JUDGE
+    D_JUDGE -->|verdict| SYNTH_CORE
+    SYNTH_CORE --> SM1
+    SYNTH_CORE --> SM2
+    SYNTH_CORE --> SM3
+    SYNTH_CORE --> SM4
+    SYNTH_CORE --> OUT
+    PSPEC -.->|validates| MQ1
+    L0 -.->|isolation| F_CORE
+    L1 -.->|auto-inject| M_CORE
+    L2 -.->|scratchpad| P_CORE
+    L3 -.->|dialogue| DEBATE
+    style FINANCE fill:#fce4ec,stroke:#c62828
+    style MATHS fill:#e8eaf6,stroke:#283593
+    style PHYSICS fill:#e0f2f1,stroke:#00695c
+    style CODE fill:#fff8e1,stroke:#f57f17
+    style F_CORE fill:#f8bbd9,stroke:#ad1457
+    style M_CORE fill:#c5cae9,stroke:#303f9f
+    style P_CORE fill:#b2dfdb,stroke:#00796b
+    style C_CORE fill:#ffe082,stroke:#ff8f00
+    style BUS fill:#fffde7,stroke:#f9a825,stroke-width:2px
+    style MQ1 fill:#bbdefb,stroke:#1976d2
+    style MQ2 fill:#ffe0b2,stroke:#ef6c00
+    style MQ3 fill:#c8e6c9,stroke:#388e3c
+    style MQ4 fill:#ffcdd2,stroke:#c62828
+    style MQ5 fill:#e1bee7,stroke:#7b1fa2
+    style MQ6 fill:#f5f5f5,stroke:#616161
+    style PROTOCOL fill:#e3f2fd,stroke:#1565c0,stroke-width:2px
+    style PSPEC fill:#bbdefb,stroke:#1565c0
+    style SYNTHESIS fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    style SYNTH_CORE fill:#c8e6c9,stroke:#2e7d32
+    style SYNTH_MODES fill:#dcedc8,stroke:#558b2f
+    style SM1 fill:#b9f6ca,stroke:#00c853
+    style SM2 fill:#b9f6ca,stroke:#00c853
+    style SM3 fill:#b9f6ca,stroke:#00c853
+    style SM4 fill:#b9f6ca,stroke:#00c853
+    style DEBATE fill:#fff3e0,stroke:#e65100
+    style D_PROPONENT fill:#c8e6c9,stroke:#2e7d32
+    style D_OPPONENT fill:#ffcdd2,stroke:#c62828
+    style D_JUDGE fill:#fff9c4,stroke:#f57f17
+    style OUTPUT fill:none,stroke:none
+    style OUT fill:#b9f6ca,stroke:#00c853,stroke-width:3px
+    style LEVELS fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px
+    style L0 fill:#e1bee7,stroke:#8e24aa
+    style L1 fill:#e1bee7,stroke:#8e24aa
+    style L2 fill:#e1bee7,stroke:#8e24aa
+    style L3 fill:#e1bee7,stroke:#8e24aa
+                </div>
+            </div>
+            <div class="legend">
+                <div class="legend-item"><div class="legend-dot" style="background:#bbdefb;border:2px solid #1976d2"></div>task_request / task_result</div>
+                <div class="legend-item"><div class="legend-dot" style="background:#ffe0b2;border:2px solid #ef6c00"></div>partial_result (streaming)</div>
+                <div class="legend-item"><div class="legend-dot" style="background:#c8e6c9;border:2px solid #388e3c"></div>context_request / response</div>
+                <div class="legend-item"><div class="legend-dot" style="background:#ffcdd2;border:2px solid #c62828"></div>error / checkpoint</div>
+                <div class="legend-item"><div class="legend-dot" style="background:#e1bee7;border:2px solid #7b1fa2"></div>synthesis_request</div>
+                <div class="legend-item"><div class="legend-dot" style="background:#f5f5f5;border:2px solid #616161"></div>health_ping</div>
+                <div class="legend-item"><div class="legend-dot" style="background:#b9f6ca;border:2px solid #00c853"></div>synthesis modes</div>
+                <div class="legend-item"><div class="legend-dot" style="background:#e1bee7;border:2px solid #8e24aa"></div>communication levels</div>
+            </div>
+            <div class="stats-bar">
+                <div class="stat">Message Types: <span class="stat-value">9</span></div>
+                <div class="stat">Comms Levels: <span class="stat-value">4 (L0-L3)</span></div>
+                <div class="stat">Synthesis Modes: <span class="stat-value">4</span></div>
+                <div class="stat">Debate Agents: <span class="stat-value">3</span></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Tab 4: Fault Tolerance -->
+    <div class="tab-content" id="tab-3">
+        <div class="diagram-section">
+            <div class="diagram-header">
+                <h2><span class="diagram-number">4</span> Fault Tolerance &amp; Recovery</h2>
+                <span class="diagram-meta">Failure detection, escalation, circuit breaker, checkpointing</span>
+            </div>
+            <div class="mermaid-container">
+                <div class="mermaid">
+graph TB
+    subgraph DETECTION["🔍 FAILURE DETECTION"]
+        direction LR
+        F1["⚠️ Tool Error&lt;br/&gt;exit != 0 | timeout | malformed"]
+        F2["👻 Hallucination&lt;br/&gt;schema validation fails"]
+        F3["🔄 Misrouting&lt;br/&gt;specialist reports 'out of domain'"]
+        F4["⏱️ Timeout&lt;br/&gt;wall time exceeded"]
+        F5["💸 Budget Exhaustion&lt;br/&gt;tokens | time | cost limit"]
+        F6["🔥 Cascading Failure&lt;br/&gt;multiple specialists fail"]
+    end
+    DETECT["🔍 DETECT&lt;br/&gt;Monitor all agents&lt;br/&gt;Correlation ID tracking"]
+    subgraph ESCALATION["📈 ESCALATION LEVELS"]
+        direction TB
+        subgraph L1["Level 1: RETRY 🟢"]
+            L1_DESC["Same agent&lt;br/&gt;Same task&lt;br/&gt;Try again"]
+            L1_COND["Applies to:&lt;br/&gt;• Network transient&lt;br/&gt;• Timeout &lt; 30s&lt;br/&gt;• Rate limit hit"]
+        end
+        subgraph L2["Level 2: REPLAN 🟡"]
+            L2_DESC["Meta-agent rewrites&lt;br/&gt;task description&lt;br/&gt;Based on failure reason"]
+            L2_COND["Applies to:&lt;br/&gt;• Wrong approach&lt;br/&gt;• Tool mismatch&lt;br/&gt;• Ambiguous task"]
+        end
+        subgraph L3["Level 3: DECOMPOSE 🟠"]
+            L3_DESC["Break into smaller&lt;br/&gt;subtasks&lt;br/&gt;Spawn smaller agents"]
+            L3_COND["Applies to:&lt;br/&gt;• Task too complex&lt;br/&gt;• Max depth reached&lt;br/&gt;• Partial failure"]
+        end
+        subgraph L4["Level 4: ESCALATE 🔴"]
+            L4_DESC["Notify user with:&lt;br/&gt;• What was attempted&lt;br/&gt;• What failed&lt;br/&gt;• Partial results&lt;br/&gt;• Suggested next steps"]
+            L4_COND["Applies to:&lt;br/&gt;• All retries exhausted&lt;br/&gt;• Circuit breaker OPEN&lt;br/&gt;• User confirmation needed"]
+        end
+    end
+    subgraph CIRCUIT["🔒 CIRCUIT BREAKER"]
+        direction TB
+        CB_CLOSED["🟢 CLOSED&lt;br/&gt;Pass through&lt;br/&gt;Normal operation"]
+        CB_OPEN["🔴 OPEN&lt;br/&gt;Block requests&lt;br/&gt;Route to alternative"]
+        CB_HALF["🟡 HALF-OPEN&lt;br/&gt;Test with N calls&lt;br/&gt;Limited traffic"]
+        CB_CLOSED -->|"5 consecutive&lt;br/&gt;failures"| CB_OPEN
+        CB_OPEN -->|"30s timeout&lt;br/&gt;elapsed"| CB_HALF
+        CB_HALF -->|"tests pass"| CB_CLOSED
+        CB_HALF -->|"tests fail"| CB_OPEN
+    end
+    subgraph CHECKPOINT["💾 CHECKPOINT STORE"]
+        direction TB
+        CP_DB["SQLite Store&lt;br/&gt;~/.omp/checkpoints/"]
+        CP1["📝 t=0&lt;br/&gt;Initial state"]
+        CP2["📝 t=1&lt;br/&gt;After tool call 1"]
+        CP3["📝 t=2&lt;br/&gt;After tool call 2"]
+        CP_LATEST["📝 t=N&lt;br/&gt;Latest checkpoint"]
+    end
+    subgraph RECOVERY["♻️ RECOVERY OUTCOMES"]
+        direction LR
+        R1["✅ Resume from&lt;br/&gt;checkpoint"]
+        R2["🔀 Route to&lt;br/&gt;alternative specialist"]
+        R3["⚠️ Graceful&lt;br/&gt;degradation&lt;br/&gt;(partial results)"]
+        R4["👤 Human&lt;br/&gt;intervention"]
+    end
+    subgraph SAFETY_NETS["🛡️ SAFETY MECHANISMS"]
+        direction TB
+        STUCK["⏱️ STUCK DETECTOR&lt;br/&gt;No tool calls for N sec&lt;br/&gt;→ Trigger escalation"]
+        DEPTH["🔻 DEPTH GUARD&lt;br/&gt;Enforce max_depth&lt;br/&gt;→ Reject spawn if exceeded"]
+        TOKEN["📄 TOKEN GUARD&lt;br/&gt;Global + per-branch&lt;br/&gt;budget enforcement"]
+    end
+    F1 --> DETECT
+    F2 --> DETECT
+    F3 --> DETECT
+    F4 --> DETECT
+    F5 --> DETECT
+    F6 --> DETECT
+    DETECT -->|transient| L1
+    DETECT -->|wrong approach| L2
+    DETECT -->|too complex| L3
+    DETECT -->|all exhausted| L4
+    L1 -->|success| R1
+    L1 -->|fails| L2
+    L2 -->|success| R1
+    L2 -->|fails| L3
+    L3 -->|partial| R3
+    L3 -->|success| R1
+    L4 --> R4
+    L1 -.->|"circuit closed"| CB_CLOSED
+    L2 -.->|"circuit open"| CB_OPEN
+    CB_OPEN -->|reroute| R2
+    CP_DB -->|restore| R1
+    CP_LATEST -.->|"resume point"| R1
+    STUCK -.->|"kill branch"| DETECT
+    DEPTH -.->|"reject"| L3
+    TOKEN -.->|"kill tree"| L4
+    style DETECTION fill:#ffebee,stroke:#c62828,stroke-width:2px
+    style F1 fill:#ffcdd2,stroke:#c62828
+    style F2 fill:#ffcdd2,stroke:#c62828
+    style F3 fill:#ffcdd2,stroke:#c62828
+    style F4 fill:#ffcdd2,stroke:#c62828
+    style F5 fill:#ffcdd2,stroke:#c62828
+    style F6 fill:#ffcdd2,stroke:#c62828
+    style DETECT fill:#ef9a9a,stroke:#b71c1c,stroke-width:3px
+    style ESCALATION fill:#fff8e1,stroke:#f57f17,stroke-width:2px
+    style L1 fill:#c8e6c9,stroke:#2e7d32,stroke-width:2px
+    style L1_DESC fill:#a5d6a7,stroke:#388e3c
+    style L1_COND fill:#dcedc8,stroke:#558b2f
+    style L2 fill:#fff9c4,stroke:#f9a825,stroke-width:2px
+    style L2_DESC fill:#fff59d,stroke:#f57f17
+    style L2_COND fill:#fff9c4,stroke:#f9a825
+    style L3 fill:#ffe0b2,stroke:#ef6c00,stroke-width:2px
+    style L3_DESC fill:#ffcc80,stroke:#ef6c00
+    style L3_COND fill:#ffe0b2,stroke:#ef6c00
+    style L4 fill:#ffcdd2,stroke:#c62828,stroke-width:2px
+    style L4_DESC fill:#ef9a9a,stroke:#c62828
+    style L4_COND fill:#ffcdd2,stroke:#c62828
+    style CIRCUIT fill:#e8eaf6,stroke:#283593,stroke-width:2px
+    style CB_CLOSED fill:#c8e6c9,stroke:#2e7d32
+    style CB_OPEN fill:#ffcdd2,stroke:#c62828
+    style CB_HALF fill:#ffe082,stroke:#ff8f00
+    style CHECKPOINT fill:#e0f2f1,stroke:#00695c,stroke-width:2px
+    style CP_DB fill:#b2dfdb,stroke:#00796b
+    style CP1 fill:#80cbc4,stroke:#00695c
+    style CP2 fill:#80cbc4,stroke:#00695c
+    style CP3 fill:#80cbc4,stroke:#00695c
+    style CP_LATEST fill:#4db6ac,stroke:#00695c,stroke-width:2px
+    style RECOVERY fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    style R1 fill:#a5d6a7,stroke:#388e3c,stroke-width:2px
+    style R2 fill:#bbdefb,stroke:#1976d2,stroke-width:2px
+    style R3 fill:#ffe082,stroke:#f57f17,stroke-width:2px
+    style R4 fill:#ffcdd2,stroke:#c62828,stroke-width:2px
+    style SAFETY_NETS fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px
+    style STUCK fill:#e1bee7,stroke:#8e24aa
+    style DEPTH fill:#e1bee7,stroke:#8e24aa
+    style TOKEN fill:#e1bee7,stroke:#8e24aa
+                </div>
+            </div>
+            <div class="legend">
+                <div class="legend-item"><div class="legend-dot" style="background:#a5d6a7;border:2px solid #388e3c"></div>Level 1: Retry (Transient)</div>
+                <div class="legend-item"><div class="legend-dot" style="background:#fff59d;border:2px solid #f57f17"></div>Level 2: Replan (Wrong approach)</div>
+                <div class="legend-item"><div class="legend-dot" style="background:#ffcc80;border:2px solid #ef6c00"></div>Level 3: Decompose (Complex)</div>
+                <div class="legend-item"><div class="legend-dot" style="background:#ef9a9a;border:2px solid #c62828"></div>Level 4: Escalate (Human)</div>
+                <div class="legend-item"><div class="legend-dot" style="background:#c8e6c9;border:2px solid #2e7d32"></div>Circuit: Closed</div>
+                <div class="legend-item"><div class="legend-dot" style="background:#ffcdd2;border:2px solid #c62828"></div>Circuit: Open</div>
+                <div class="legend-item"><div class="legend-dot" style="background:#ffe082;border:2px solid #ff8f00"></div>Circuit: Half-Open</div>
+                <div class="legend-item"><div class="legend-dot" style="background:#80cbc4;border:2px solid #00695c"></div>Checkpoint Store</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Tab 5: All Diagrams -->
+    <div class="tab-content" id="tab-4">
+        <div class="diagram-section">
+            <div class="diagram-header">
+                <h2><span class="diagram-number">1</span> System Architecture Overview</h2>
+            </div>
+            <div class="mermaid-container">
+                <div class="mermaid">
+graph TB
+    USER([👤 User]) --> CLASSIFIER["🧠 Intent Classifier"]
+    CLASSIFIER --> ROUTER["🌐 Gateway Router"]
+    ROUTER --> FINANCE["💰 Finance Harness&lt;br/&gt;~800 Skills | FUSE Sandbox"]
+    ROUTER --> MATHS["📐 Maths Harness&lt;br/&gt;~600 Skills | FUSE Sandbox"]
+    ROUTER --> PHYSICS["⚛️ Physics Harness&lt;br/&gt;~500 Skills | FUSE Sandbox"]
+    ROUTER --> CODE["💻 Code Harness&lt;br/&gt;~1200 Skills | FUSE Sandbox"]
+    ROUTER --> RESEARCH["🔍 Research Harness&lt;br/&gt;~400 Skills | FUSE Sandbox"]
+    ROUTER --> REPORTER["📄 Reporter Harness&lt;br/&gt;~300 Skills | Synthesis"]
+    FINANCE -.->|spawn| SUB["🟣 Subagent Layer&lt;br/&gt;Max Depth: 3"]
+    MATHS -.->|spawn| SUB
+    PHYSICS -.->|spawn| SUB
+    CODE -.->|spawn| SUB
+    FINANCE -->|result| SYNTH["📝 Synthesis Layer"]
+    MATHS -->|result| SYNTH
+    PHYSICS -->|result| SYNTH
+    CODE -->|result| SYNTH
+    RESEARCH -->|result| SYNTH
+    REPORTER -->|result| SYNTH
+    SUB -->|results| SYNTH
+    SYNTH --> OUT([📋 Structured Output])
+    FINANCE -.->|publish| BUS["📬 Message Bus"]
+    MATHS -.->|publish| BUS
+    SYNTH -.->|consume| BUS
+    style USER fill:#e8f5e9,stroke:#2e7d32,stroke-width:3px
+    style ROUTER fill:#fff3e0,stroke:#e65100,stroke-width:3px
+    style FINANCE fill:#fce4ec,stroke:#c62828
+    style MATHS fill:#e8eaf6,stroke:#283593
+    style PHYSICS fill:#e0f2f1,stroke:#00695c
+    style CODE fill:#fff8e1,stroke:#f57f17
+    style RESEARCH fill:#f1f8e9,stroke:#558b2f
+    style REPORTER fill:#efebe9,stroke:#4e342e
+    style SUB fill:#ede7f6,stroke:#4527a0,stroke-width:2px
+    style SYNTH fill:#c8e6c9,stroke:#2e7d32
+    style OUT fill:#b9f6ca,stroke:#00c853,stroke-width:3px
+    style BUS fill:#fff9c4,stroke:#f57f17
+                </div>
+            </div>
+        </div>
+        <div class="diagram-section">
+            <div class="diagram-header">
+                <h2><span class="diagram-number">2</span> Recursive Spawn Flow</h2>
+            </div>
+            <div class="mermaid-container">
+                <div class="mermaid">
+graph TB
+    L0["🔷 Gateway&lt;br/&gt;depth=3 budget=100K $2.00"] --> L1["💰 Finance&lt;br/&gt;depth=1 budget=30K"]
+    L1 --> A1["⚙️ explore&lt;br/&gt;depth=2 budget=10K"]
+    L1 --> A2["⚙️ calculate&lt;br/&gt;depth=2 budget=10K"]
+    A1 --> L2["⚙️ explore-agent&lt;br/&gt;depth=2 budget=10K"]
+    L2 --> B1["⚙️ data-extract&lt;br/&gt;depth=1 budget=5K"]
+    L2 --> B2["⚙️ analysis&lt;br/&gt;depth=1 budget=3K"]
+    B1 --> LEAF1["🍃 LEAF&lt;br/&gt;MAX DEPTH ⛔"]
+    B2 --> LEAF2["🍃 LEAF&lt;br/&gt;MAX DEPTH ⛔"]
+    A2 --> LEAF3["🍃 LEAF&lt;br/&gt;MAX DEPTH ⛔"]
+    LEAF1 --> AGG["📦 Aggregate"]
+    LEAF2 --> AGG
+    LEAF3 --> AGG
+    AGG --> SYNTH["📝 Synthesis"]
+    style L0 fill:#fff3e0,stroke:#e65100
+    style L1 fill:#f8bbd9,stroke:#c62828
+    style A1 fill:#f48fb1,stroke:#ad1457
+    style A2 fill:#f48fb1,stroke:#ad1457
+    style L2 fill:#d1c4e9,stroke:#6a1b9a
+    style B1 fill:#b39ddb,stroke:#7b1fa2
+    style B2 fill:#b39ddb,stroke:#7b1fa2
+    style LEAF1 fill:#a5d6a7,stroke:#388e3c
+    style LEAF2 fill:#a5d6a7,stroke:#388e3c
+    style LEAF3 fill:#a5d6a7,stroke:#388e3c
+    style AGG fill:#fff59d,stroke:#f57f17
+    style SYNTH fill:#c8e6c9,stroke:#2e7d32
+                </div>
+            </div>
+        </div>
+        <div class="diagram-section">
+            <div class="diagram-header">
+                <h2><span class="diagram-number">3</span> Communication Protocol</h2>
+            </div>
+            <div class="mermaid-container">
+                <div class="mermaid">
+graph LR
+    F["💰 Finance"] -->|task_request| BUS["📬 Message Bus"]
+    M["📐 Maths"] -->|partial_result| BUS
+    P["⚛️ Physics"] -->|context_request| BUS
+    C["💻 Code"] -->|error| BUS
+    BUS -->|synthesis_request| R["📝 Reporter"]
+    R --> OUT([📋 Output])
+    R --> D["🗣️ Debate&lt;br/&gt;(Hermes)"]
+    D --> R
+    style F fill:#fce4ec,stroke:#c62828
+    style M fill:#e8eaf6,stroke:#283593
+    style P fill:#e0f2f1,stroke:#00695c
+    style C fill:#fff8e1,stroke:#f57f17
+    style BUS fill:#fff9c4,stroke:#f57f17
+    style R fill:#c8e6c9,stroke:#2e7d32
+    style OUT fill:#b9f6ca,stroke:#00c853,stroke-width:3px
+    style D fill:#fff3e0,stroke:#e65100
+                </div>
+            </div>
+        </div>
+        <div class="diagram-section">
+            <div class="diagram-header">
+                <h2><span class="diagram-number">4</span> Fault Tolerance</h2>
+            </div>
+            <div class="mermaid-container">
+                <div class="mermaid">
+graph TB
+    DET["🔍 DETECT"] --> L1["🟢 RETRY"]
+    DET --> L2["🟡 REPLAN"]
+    DET --> L3["🟠 DECOMPOSE"]
+    DET --> L4["🔴 ESCALATE"]
+    L1 -->|fails| L2
+    L2 -->|fails| L3
+    L1 -->|ok| R1["✅ Resume"]
+    L2 -->|ok| R1
+    L3 -->|ok| R1
+    L3 -->|partial| R3["⚠️ Partial"]
+    L4 --> R4["👤 Human"]
+    CB["🔒 Circuit&lt;br/&gt;Breaker"] -->|reroute| R2["🔀 Alternative"]
+    CP["💾 Checkpoint"] --> R1
+    style DET fill:#ef9a9a,stroke:#b71c1c
+    style L1 fill:#a5d6a7,stroke:#388e3c
+    style L2 fill:#fff59d,stroke:#f57f17
+    style L3 fill:#ffcc80,stroke:#ef6c00
+    style L4 fill:#ef9a9a,stroke:#c62828
+    style R1 fill:#a5d6a7,stroke:#388e3c
+    style R2 fill:#bbdefb,stroke:#1976d2
+    style R3 fill:#ffe082,stroke:#ff8f00
+    style R4 fill:#ffcdd2,stroke:#c62828
+    style CB fill:#e8eaf6,stroke:#283593
+    style CP fill:#b2dfdb,stroke:#00796b
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function showTab(index) {
+            document.querySelectorAll('.tab-content').forEach((el, i) => {
+                el.classList.toggle('active', i === index);
+            });
+            document.querySelectorAll('.nav-tab').forEach((el, i) => {
+                el.classList.toggle('active', i === index);
+            });
+        }
+
+        mermaid.initialize({
+            startOnLoad: true,
+            theme: 'dark',
+            themeVariables: {
+                fontFamily: 'Segoe UI, system-ui, sans-serif',
+                fontSize: '14px',
+                primaryColor: '#6366f1',
+                primaryTextColor: '#e2e8f0',
+                primaryBorderColor: '#4f46e5',
+                lineColor: '#64748b',
+                secondaryColor: '#1e293b',
+                tertiaryColor: '#0f172a',
+                background: '#0a0e27'
+            },
+            flowchart: {
+                curve: 'basis',
+                padding: 20,
+                nodeSpacing: 50,
+                rankSpacing: 60,
+                useMaxWidth: true,
+                htmlLabels: true
+            },
+            sequence: {
+                useMaxWidth: true
+            }
+        });
+    </script>
+</body>
+</html>

@@ -58,7 +58,7 @@ def cron_list(show_all: bool = False):
     for job in jobs:
         job_id = job.get("id", "?")
         name = job.get("name", "(unnamed)")
-        schedule = job.get("schedule_display", job.get("schedule", {}).get("value", "?"))
+        schedule = job.get("schedule_display", (job.get("schedule") or {}).get("value", "?"))
         state = job.get("state", "scheduled" if job.get("enabled", True) else "paused")
         next_run = job.get("next_run_at", "?")
 
@@ -77,6 +77,8 @@ def cron_list(show_all: bool = False):
             status = color("[paused]", Colors.YELLOW)
         elif state == "completed":
             status = color("[completed]", Colors.BLUE)
+        elif state == "reactive_waiting":
+            status = color("[reactive]", Colors.CYAN)
         elif job.get("enabled", True):
             status = color("[active]", Colors.GREEN)
         else:
@@ -93,8 +95,12 @@ def cron_list(show_all: bool = False):
         script = job.get("script")
         if script:
             print(f"    Script:    {script}")
+        trigger = job.get("reactive_trigger")
+        if trigger:
+            print(
+                f"    Reactive:  after {trigger.get('after_consecutive_failures')} failure(s) of {trigger.get('job_id')}"
+            )
 
-        # Execution history
         last_status = job.get("last_status")
         if last_status:
             last_run = job.get("last_run_at", "?")
@@ -103,6 +109,13 @@ def cron_list(show_all: bool = False):
             else:
                 status_display = color(f"{last_status}: {job.get('last_error', '?')}", Colors.RED)
             print(f"    Last run:  {last_run}  {status_display}")
+
+        health = job.get("health") or {}
+        total_runs = health.get("total_runs", 0)
+        if total_runs:
+            print(
+                f"    Health:    runs={total_runs} success_rate={health.get('success_rate')} consecutive_failures={health.get('consecutive_failures', 0)}"
+            )
 
         delivery_err = job.get("last_delivery_error")
         if delivery_err:
@@ -158,16 +171,26 @@ def cron_status():
 
 
 def cron_create(args):
+    schedule_value = getattr(args, "schedule", None)
+    prompt_value = getattr(args, "prompt", None)
+
+    if getattr(args, "reactive_only", False):
+        if prompt_value is None and schedule_value is not None:
+            prompt_value = schedule_value
+        schedule_value = None
+
     result = _cron_api(
         action="create",
-        schedule=args.schedule,
-        prompt=args.prompt,
+        schedule=schedule_value,
+        prompt=prompt_value,
         name=getattr(args, "name", None),
         deliver=getattr(args, "deliver", None),
         repeat=getattr(args, "repeat", None),
         skill=getattr(args, "skill", None),
         skills=_normalize_skills(getattr(args, "skill", None), getattr(args, "skills", None)),
         script=getattr(args, "script", None),
+        trigger_job_id=getattr(args, "trigger_job_id", None),
+        trigger_after_failures=getattr(args, "trigger_after_failures", None),
     )
     if not result.get("success"):
         print(color(f"Failed to create job: {result.get('error', 'unknown error')}", Colors.RED))
@@ -180,6 +203,9 @@ def cron_create(args):
     job_data = result.get("job", {})
     if job_data.get("script"):
         print(f"  Script: {job_data['script']}")
+    if job_data.get("reactive_trigger"):
+        trigger = job_data["reactive_trigger"]
+        print(f"  Reactive: after {trigger['after_consecutive_failures']} failure(s) of {trigger['job_id']}")
     print(f"  Next run: {result['next_run_at']}")
     return 0
 
@@ -208,16 +234,20 @@ def cron_edit(args):
             if skill not in final_skills:
                 final_skills.append(skill)
 
+    schedule_value = "" if getattr(args, "clear_schedule", False) else getattr(args, "schedule", None)
     result = _cron_api(
         action="update",
         job_id=args.job_id,
-        schedule=getattr(args, "schedule", None),
+        schedule=schedule_value,
         prompt=getattr(args, "prompt", None),
         name=getattr(args, "name", None),
         deliver=getattr(args, "deliver", None),
         repeat=getattr(args, "repeat", None),
         skills=final_skills,
         script=getattr(args, "script", None),
+        trigger_job_id=None if getattr(args, "clear_trigger", False) else getattr(args, "trigger_job_id", None),
+        trigger_after_failures=None if getattr(args, "clear_trigger", False) else getattr(args, "trigger_after_failures", None),
+        clear_trigger=getattr(args, "clear_trigger", False),
     )
     if not result.get("success"):
         print(color(f"Failed to update job: {result.get('error', 'unknown error')}", Colors.RED))
@@ -233,6 +263,9 @@ def cron_edit(args):
         print("  Skills: none")
     if updated.get("script"):
         print(f"  Script: {updated['script']}")
+    if updated.get("reactive_trigger"):
+        trigger = updated["reactive_trigger"]
+        print(f"  Reactive: after {trigger['after_consecutive_failures']} failure(s) of {trigger['job_id']}")
     return 0
 
 

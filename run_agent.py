@@ -106,6 +106,15 @@ from agent.trajectory import (
     convert_scratchpad_to_think, has_incomplete_scratchpad,
     save_trajectory as _save_trajectory_to_file,
 )
+from agent.runtime_signals import (
+    RuntimeSignalRef,
+    blocked_signal,
+    completed_signal,
+    emit_runtime_signal,
+    failed_signal,
+    requested_signal,
+    started_signal,
+)
 from utils import atomic_json_write, env_var_enabled
 
 
@@ -1247,7 +1256,7 @@ class AIAgent:
                         "reasoning_config": reasoning_config,
                         "max_tokens": max_tokens,
                     },
-                    user_id=None,
+                    user_id=self._user_id,
                     parent_session_id=self._parent_session_id,
                 )
             except Exception as e:
@@ -1260,10 +1269,13 @@ class AIAgent:
                 logger.warning(
                     "Session DB create_session failed (session_search still available): %s", e
                 )
-        
+
+        from agent.mission_state import MissionService
+        self._mission_service = MissionService(self._session_db) if self._session_db else None
+
         # In-memory todo list for task planning (one per agent/session)
         from tools.todo_tool import TodoStore
-        self._todo_store = TodoStore()
+        self._todo_store = TodoStore(session_id=self.session_id, mission_service=self._mission_service)
         
         # Load config once for memory, skills, and compression sections
         try:
@@ -1352,6 +1364,22 @@ class AIAgent:
             except Exception as _mpe:
                 logger.warning("Memory provider plugin init failed: %s", _mpe)
                 self._memory_manager = None
+
+        self._shared_memory_service = None
+        if self._memory_store or self._memory_manager or self._session_db:
+            try:
+                from agent.shared_memory import SharedMemoryService
+                self._shared_memory_service = SharedMemoryService(
+                    memory_store=self._memory_store,
+                    memory_manager=self._memory_manager,
+                    session_db=self._session_db,
+                    current_session_id=self.session_id,
+                    user_id=self._user_id,
+                    source=self.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+                )
+            except Exception as _shared_mem_exc:
+                logger.warning("Shared memory service init failed: %s", _shared_mem_exc)
+
 
         # Inject memory provider tool schemas into the tool surface.
         # Skip tools whose names already exist (plugins may register the
@@ -2605,6 +2633,7 @@ class AIAgent:
                 self.session_id,
                 source=self.platform or "cli",
                 model=self.model,
+                user_id=self._user_id,
             )
             start_idx = len(conversation_history) if conversation_history else 0
             flush_from = max(start_idx, self._last_flushed_db_idx)
@@ -3024,6 +3053,246 @@ class AIAgent:
         summary["prompt_tokens"] = cu.prompt_tokens
         summary["total_tokens"] = cu.total_tokens
         return summary
+
+    @staticmethod
+    def _runtime_signal_subject(kind: Optional[str], identifier: Optional[str]) -> Optional[RuntimeSignalRef]:
+        if not kind or not identifier:
+            return None
+        return RuntimeSignalRef(kind=kind, id=identifier)
+
+    @staticmethod
+    def _runtime_signal_argument_summary(args: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        if not isinstance(args, dict):
+            return {"argument_count": 0, "argument_keys": []}
+        return {
+            "argument_count": len(args),
+            "argument_keys": sorted(str(key) for key in args.keys()),
+        }
+
+    @staticmethod
+    def _safe_base_url_for_signal(base_url: str) -> str:
+        from urllib.parse import urlsplit, urlunsplit
+        if not base_url:
+            return ""
+        try:
+            parts = urlsplit(base_url)
+        except Exception:
+            return base_url
+        netloc = parts.hostname or ""
+        if parts.port:
+            netloc = f"{netloc}:{parts.port}"
+        return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+
+
+
+    def _bridge_memory_write(
+        self,
+        *,
+        action: str,
+        target: str,
+        content: str | None,
+        old_text: str | None,
+        tool_result: str,
+    ) -> None:
+        if not self._memory_manager or action not in ("add", "replace", "remove"):
+            return
+        try:
+            parsed = json.loads(tool_result)
+            mutated = bool(parsed.get("mutated")) if isinstance(parsed, dict) else False
+            current_state = parsed.get("entries") if isinstance(parsed, dict) else None
+            if not mutated:
+                return
+            self._memory_manager.on_memory_write(
+                action,
+                target,
+                content or "",
+                old_text=old_text,
+                current_state=current_state if isinstance(current_state, list) else None,
+            )
+        except Exception:
+            pass
+
+    def _emit_runtime_signal(
+        self,
+        *,
+        event_type: str,
+        phase: str,
+        payload: Optional[Dict[str, Any]] = None,
+        correlation_id: Optional[str] = None,
+        mission_id: Optional[str] = None,
+        subject: Optional[RuntimeSignalRef] = None,
+        idempotency_key: Optional[str] = None,
+        hook_name: Optional[str] = None,
+        hook_kwargs: Optional[Dict[str, Any]] = None,
+        hook_invoker: Any = None,
+        hook_failure_result: Any = None,
+        hook_failure_log_level: str = "warning",
+    ) -> Any:
+        signal_factory = {
+            "requested": requested_signal,
+            "started": started_signal,
+            "completed": completed_signal,
+            "failed": failed_signal,
+            "blocked": blocked_signal,
+        }[phase]
+        signal = signal_factory(
+            event_type=event_type,
+            publisher="run_agent._emit_runtime_signal",
+            session_id=self.session_id or None,
+            mission_id=mission_id,
+            correlation_id=correlation_id or self.session_id or str(uuid.uuid4()),
+            actor=self._runtime_signal_subject("agent_session", self.session_id or None),
+            subject=subject,
+            payload=payload,
+            idempotency_key=idempotency_key,
+        )
+        return emit_runtime_signal(
+            signal,
+            session_db=self._session_db,
+            hook_name=hook_name,
+            hook_kwargs=hook_kwargs,
+            hook_invoker=hook_invoker,
+            hook_failure_result=hook_failure_result,
+            logger=logger,
+            hook_failure_log_level=hook_failure_log_level,
+        )
+
+    def _current_mission_id(self) -> Optional[str]:
+        if not self._mission_service or not self.session_id:
+            return None
+        try:
+            return self._mission_service.get_attached_mission_id(self.session_id)
+        except Exception:
+            logger.debug("Could not resolve current mission attachment", exc_info=True)
+            return None
+
+
+    @staticmethod
+    def _resolve_pre_tool_block_message(hook_name: str, hook_kwargs: Dict[str, Any]) -> Optional[str]:
+        from hermes_cli.plugins import get_pre_tool_call_block_message
+        return get_pre_tool_call_block_message(
+            hook_kwargs.get("tool_name") or "",
+            hook_kwargs.get("args"),
+            task_id=hook_kwargs.get("task_id") or "",
+            session_id=hook_kwargs.get("session_id") or "",
+            tool_call_id=hook_kwargs.get("tool_call_id") or "",
+        )
+
+    def _emit_pre_tool_signal(
+        self,
+        *,
+        function_name: str,
+        function_args: Dict[str, Any],
+        effective_task_id: str,
+        tool_call_id: Optional[str] = None,
+    ) -> Optional[str]:
+        tool_correlation_id = f"{self.session_id or 'sessionless'}:tool:{tool_call_id or function_name}"
+        hook_kwargs = {
+            "tool_name": function_name,
+            "args": function_args,
+            "task_id": effective_task_id or "",
+            "session_id": self.session_id or "",
+            "tool_call_id": tool_call_id or "",
+        }
+        return self._emit_runtime_signal(
+            event_type="tool.call",
+            phase="requested",
+            correlation_id=tool_correlation_id,
+            mission_id=self._current_mission_id(),
+            idempotency_key=f"{tool_correlation_id}:requested",
+            payload={
+                "tool_name": function_name,
+                "tool_call_id": tool_call_id or "",
+                "task_id": effective_task_id or "",
+                **self._runtime_signal_argument_summary(function_args),
+            },
+            subject=self._runtime_signal_subject("tool", function_name),
+            hook_name="pre_tool_call",
+            hook_kwargs=hook_kwargs,
+            hook_invoker=self._resolve_pre_tool_block_message,
+            hook_failure_log_level="debug",
+        )
+
+    def _emit_post_tool_signal(
+        self,
+        *,
+        function_name: str,
+        function_args: Dict[str, Any],
+        function_result: str,
+        effective_task_id: str,
+        tool_call_id: Optional[str] = None,
+        phase: str = "completed",
+        tool_duration: Optional[float] = None,
+        blocked_message: Optional[str] = None,
+        invoke_hook: bool = True,
+    ) -> None:
+        tool_correlation_id = f"{self.session_id or 'sessionless'}:tool:{tool_call_id or function_name}"
+        hook_kwargs = {
+            "tool_name": function_name,
+            "args": function_args,
+            "result": function_result,
+            "task_id": effective_task_id or "",
+            "session_id": self.session_id or "",
+            "tool_call_id": tool_call_id or "",
+        }
+        self._emit_runtime_signal(
+            event_type="tool.call",
+            phase=phase,
+            correlation_id=tool_correlation_id,
+            mission_id=self._current_mission_id(),
+            idempotency_key=f"{tool_correlation_id}:{phase}",
+            payload={
+                "tool_name": function_name,
+                "tool_call_id": tool_call_id or "",
+                "task_id": effective_task_id or "",
+                "result_length": len(function_result),
+                "tool_duration": tool_duration,
+                "blocked_message": blocked_message,
+                **self._runtime_signal_argument_summary(function_args),
+            },
+            subject=self._runtime_signal_subject("tool", function_name),
+            hook_name="post_tool_call" if invoke_hook else None,
+            hook_kwargs=hook_kwargs if invoke_hook else None,
+            hook_failure_log_level="debug",
+        )
+    def _emit_terminal_request_failures(
+        self,
+        *,
+        llm_correlation_id: Optional[str],
+        api_correlation_id: Optional[str],
+        effective_task_id: str,
+        api_call_count: int,
+        error_summary: Any,
+    ) -> None:
+        error_message = str(error_summary or "")
+        error_payload = {
+            "api_call_count": api_call_count,
+            "error_class": type(error_summary).__name__,
+            "error_message_chars": len(error_message),
+        }
+        subject = self._runtime_signal_subject("model", self.model)
+        if api_correlation_id:
+            self._emit_runtime_signal(
+                event_type="api.request",
+                phase="failed",
+                correlation_id=api_correlation_id,
+                mission_id=self._current_mission_id(),
+                idempotency_key=f"{api_correlation_id}:failed",
+                payload=error_payload,
+                subject=subject,
+                hook_failure_log_level="debug",
+            )
+        if llm_correlation_id:
+            self._emit_runtime_signal(
+                event_type="llm.call",
+                phase="failed",
+                correlation_id=llm_correlation_id,
+                mission_id=self._current_mission_id(),
+                idempotency_key=f"{llm_correlation_id}:failed",
+                payload=error_payload,
+                subject=subject,
+                hook_failure_log_level="debug",
+            )
 
     def _dump_api_request_debug(
         self,
@@ -3597,6 +3866,14 @@ class AIAgent:
         TodoStore is empty. We scan the history for the most recent todo
         tool response and replay it to reconstruct the state.
         """
+        if self._mission_service and self.session_id:
+            try:
+                if self._mission_service.get_attached_mission_id(self.session_id):
+                    _set_interrupt(False)
+                    return
+            except Exception:
+                pass
+
         # Walk history backwards to find the most recent todo tool response
         last_todo_response = None
         for msg in reversed(history):
@@ -7554,12 +7831,19 @@ class AIAgent:
                         args = json.loads(tc.function.arguments)
                         flush_target = args.get("target", "memory")
                         from tools.memory_tool import memory_tool as _memory_tool
-                        _memory_tool(
+                        _flush_result = _memory_tool(
                             action=args.get("action"),
                             target=flush_target,
                             content=args.get("content"),
                             old_text=args.get("old_text"),
                             store=self._memory_store,
+                        )
+                        self._bridge_memory_write(
+                            action=args.get("action", ""),
+                            target=flush_target,
+                            content=args.get("content"),
+                            old_text=args.get("old_text"),
+                            tool_result=_flush_result,
                         )
                         if not self.quiet_mode:
                             print(f"  🧠 Memory flush: saved to {args.get('target', 'memory')}")
@@ -7623,6 +7907,7 @@ class AIAgent:
                 self.commit_memory_session(messages)
                 self._session_db.end_session(self.session_id, "compression")
                 old_session_id = self.session_id
+                old_session_log_file = self.session_log_file
                 self.session_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
                 # Update session_log_file to point to the new session's JSON file
                 self.session_log_file = self.logs_dir / f"session_{self.session_id}.json"
@@ -7630,12 +7915,31 @@ class AIAgent:
                     session_id=self.session_id,
                     source=self.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
                     model=self.model,
+                    user_id=self._user_id,
                     parent_session_id=old_session_id,
                 )
+                try:
+                    if self._mission_service:
+                        self._mission_service.copy_session_work_context(old_session_id, self.session_id)
+                except Exception:
+                    try:
+                        self._session_db.delete_session(self.session_id)
+                        self._session_db.reopen_session(old_session_id)
+                    except Exception:
+                        pass
+                    self.session_id = old_session_id
+                    self.session_log_file = old_session_log_file
+                    self._todo_store.bind_session(self.session_id, self._mission_service)
+                    raise
+                self._todo_store.bind_session(self.session_id, self._mission_service)
                 # Auto-number the title for the continuation session
                 if old_title:
                     try:
-                        new_title = self._session_db.get_next_title_in_lineage(old_title)
+                        new_title = self._session_db.get_next_title_in_lineage(
+                            old_title,
+                            source=self.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+                            user_id=self._user_id,
+                        )
                         self._session_db.set_session_title(self.session_id, new_title)
                     except (ValueError, Exception) as e:
                         logger.debug("Could not propagate title on compression: %s", e)
@@ -7710,36 +8014,77 @@ class AIAgent:
         tools. Used by the concurrent execution path; the sequential path retains
         its own inline invocation for backward-compatible display handling.
         """
-        # Check plugin hooks for a block directive before executing anything.
-        block_message: Optional[str] = None
-        try:
-            from hermes_cli.plugins import get_pre_tool_call_block_message
-            block_message = get_pre_tool_call_block_message(
-                function_name, function_args, task_id=effective_task_id or "",
-            )
-        except Exception:
-            pass
+        block_message = self._emit_pre_tool_signal(
+            function_name=function_name,
+            function_args=function_args,
+            effective_task_id=effective_task_id,
+            tool_call_id=tool_call_id,
+        )
         if block_message is not None:
-            return json.dumps({"error": block_message}, ensure_ascii=False)
+            blocked_result = json.dumps({"error": block_message}, ensure_ascii=False)
+            self._emit_post_tool_signal(
+                function_name=function_name,
+                function_args=function_args,
+                function_result=blocked_result,
+                effective_task_id=effective_task_id,
+                tool_call_id=tool_call_id,
+                phase="blocked",
+                blocked_message=block_message,
+            )
+            return blocked_result
 
+        invoke_post_tool_hook = True
         if function_name == "todo":
             from tools.todo_tool import todo_tool as _todo_tool
-            return _todo_tool(
+            result = _todo_tool(
                 todos=function_args.get("todos"),
                 merge=function_args.get("merge", False),
                 store=self._todo_store,
             )
+        elif function_name == "mission":
+            from tools.mission_tool import mission_tool as _mission_tool
+            result = _mission_tool(
+                action=function_args.get("action", ""),
+                mission_id=function_args.get("mission_id"),
+                title=function_args.get("title"),
+                description=function_args.get("description"),
+                status=function_args.get("status"),
+                session_id=self.session_id,
+                node_id=function_args.get("node_id"),
+                parent_node_id=function_args.get("parent_node_id"),
+                node_type=function_args.get("node_type"),
+                external_id=function_args.get("external_id"),
+                content=function_args.get("content"),
+                body=function_args.get("body"),
+                position=function_args.get("position"),
+                metadata=function_args.get("metadata"),
+                source_node_id=function_args.get("source_node_id"),
+                target_node_id=function_args.get("target_node_id"),
+                link_type=function_args.get("link_type"),
+                todos=function_args.get("todos"),
+                merge=function_args.get("merge", False),
+                checkpoint_type=function_args.get("checkpoint_type"),
+                payload=function_args.get("payload"),
+                service=self._mission_service,
+                db=self._session_db,
+            )
         elif function_name == "session_search":
             if not self._session_db:
-                return json.dumps({"success": False, "error": "Session database not available."})
-            from tools.session_search_tool import session_search as _session_search
-            return _session_search(
-                query=function_args.get("query", ""),
-                role_filter=function_args.get("role_filter"),
-                limit=function_args.get("limit", 3),
-                db=self._session_db,
-                current_session_id=self.session_id,
-            )
+                result = json.dumps({"success": False, "error": "Session database not available."})
+            else:
+                from tools.session_search_tool import session_search as _session_search
+                if self.platform not in {None, "cli", "tui", "local"} and not self._user_id:
+                    result = json.dumps({"success": False, "error": "Session search is unavailable without a user identity."})
+                else:
+                    result = _session_search(
+                        query=function_args.get("query", ""),
+                        role_filter=function_args.get("role_filter"),
+                        limit=function_args.get("limit", 3),
+                        db=self._session_db,
+                        current_session_id=self.session_id,
+                        user_id=self._user_id,
+                        source=self.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+                    )
         elif function_name == "memory":
             target = function_args.get("target", "memory")
             from tools.memory_tool import memory_tool as _memory_tool
@@ -7750,29 +8095,26 @@ class AIAgent:
                 old_text=function_args.get("old_text"),
                 store=self._memory_store,
             )
-            # Bridge: notify external memory provider of built-in memory writes
-            if self._memory_manager and function_args.get("action") in ("add", "replace"):
-                try:
-                    self._memory_manager.on_memory_write(
-                        function_args.get("action", ""),
-                        target,
-                        function_args.get("content", ""),
-                    )
-                except Exception:
-                    pass
-            return result
+            self._bridge_memory_write(
+                action=function_args.get("action", ""),
+                target=target,
+                content=function_args.get("content"),
+                old_text=function_args.get("old_text"),
+                tool_result=result,
+            )
+
         elif self._memory_manager and self._memory_manager.has_tool(function_name):
-            return self._memory_manager.handle_tool_call(function_name, function_args)
+            result = self._memory_manager.handle_tool_call(function_name, function_args)
         elif function_name == "clarify":
             from tools.clarify_tool import clarify_tool as _clarify_tool
-            return _clarify_tool(
+            result = _clarify_tool(
                 question=function_args.get("question", ""),
                 choices=function_args.get("choices"),
                 callback=self.clarify_callback,
             )
         elif function_name == "delegate_task":
             from tools.delegate_tool import delegate_task as _delegate_task
-            return _delegate_task(
+            result = _delegate_task(
                 goal=function_args.get("goal"),
                 context=function_args.get("context"),
                 toolsets=function_args.get("toolsets"),
@@ -7781,13 +8123,26 @@ class AIAgent:
                 parent_agent=self,
             )
         else:
-            return handle_function_call(
+            invoke_post_tool_hook = False
+            result = handle_function_call(
                 function_name, function_args, effective_task_id,
                 tool_call_id=tool_call_id,
                 session_id=self.session_id or "",
                 enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
                 skip_pre_tool_call_hook=True,
             )
+
+        phase = "failed" if _detect_tool_failure(function_name, result)[0] else "completed"
+        self._emit_post_tool_signal(
+            function_name=function_name,
+            function_args=function_args,
+            function_result=result,
+            effective_task_id=effective_task_id,
+            tool_call_id=tool_call_id,
+            phase=phase,
+            invoke_hook=invoke_post_tool_hook,
+        )
+        return result
 
     @staticmethod
     def _wrap_verbose(label: str, text: str, indent: str = "     ") -> str:
@@ -8144,15 +8499,12 @@ class AIAgent:
             if not isinstance(function_args, dict):
                 function_args = {}
 
-            # Check plugin hooks for a block directive before executing.
-            _block_msg: Optional[str] = None
-            try:
-                from hermes_cli.plugins import get_pre_tool_call_block_message
-                _block_msg = get_pre_tool_call_block_message(
-                    function_name, function_args, task_id=effective_task_id or "",
-                )
-            except Exception:
-                pass
+            _block_msg = self._emit_pre_tool_signal(
+                function_name=function_name,
+                function_args=function_args,
+                effective_task_id=effective_task_id,
+                tool_call_id=tool_call.id,
+            )
 
             if _block_msg is not None:
                 # Tool blocked by plugin policy — skip counter resets.
@@ -8226,6 +8578,7 @@ class AIAgent:
                     pass  # never block tool execution
 
             tool_start_time = time.time()
+            invoke_post_tool_hook = True
 
             if _block_msg is not None:
                 # Tool blocked by plugin policy — return error without executing.
@@ -8241,18 +8594,53 @@ class AIAgent:
                 tool_duration = time.time() - tool_start_time
                 if self._should_emit_quiet_tool_messages():
                     self._vprint(f"  {_get_cute_tool_message_impl('todo', function_args, tool_duration, result=function_result)}")
+            elif function_name == "mission":
+                from tools.mission_tool import mission_tool as _mission_tool
+                function_result = _mission_tool(
+                    action=function_args.get("action", ""),
+                    mission_id=function_args.get("mission_id"),
+                    title=function_args.get("title"),
+                    description=function_args.get("description"),
+                    status=function_args.get("status"),
+                    session_id=self.session_id,
+                    node_id=function_args.get("node_id"),
+                    parent_node_id=function_args.get("parent_node_id"),
+                    node_type=function_args.get("node_type"),
+                    external_id=function_args.get("external_id"),
+                    content=function_args.get("content"),
+                    body=function_args.get("body"),
+                    position=function_args.get("position"),
+                    metadata=function_args.get("metadata"),
+                    source_node_id=function_args.get("source_node_id"),
+                    target_node_id=function_args.get("target_node_id"),
+                    link_type=function_args.get("link_type"),
+                    todos=function_args.get("todos"),
+                    merge=function_args.get("merge", False),
+                    checkpoint_type=function_args.get("checkpoint_type"),
+                    payload=function_args.get("payload"),
+                    service=self._mission_service,
+                    db=self._session_db,
+                )
+                tool_duration = time.time() - tool_start_time
+                if self._should_emit_quiet_tool_messages():
+                    self._vprint(f"  {_get_cute_tool_message_impl('mission', function_args, tool_duration, result=function_result)}")
             elif function_name == "session_search":
                 if not self._session_db:
                     function_result = json.dumps({"success": False, "error": "Session database not available."})
                 else:
                     from tools.session_search_tool import session_search as _session_search
-                    function_result = _session_search(
-                        query=function_args.get("query", ""),
-                        role_filter=function_args.get("role_filter"),
-                        limit=function_args.get("limit", 3),
-                        db=self._session_db,
-                        current_session_id=self.session_id,
-                    )
+                    if self.platform not in {None, "cli", "tui", "local"} and not self._user_id:
+                        function_result = json.dumps({"success": False, "error": "Session search is unavailable without a user identity."})
+                    else:
+                        function_result = _session_search(
+                            query=function_args.get("query", ""),
+                            role_filter=function_args.get("role_filter"),
+                            limit=function_args.get("limit", 3),
+                            db=self._session_db,
+                            current_session_id=self.session_id,
+                            user_id=self._user_id,
+                            source=self.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+                        )
                 tool_duration = time.time() - tool_start_time
                 if self._should_emit_quiet_tool_messages():
                     self._vprint(f"  {_get_cute_tool_message_impl('session_search', function_args, tool_duration, result=function_result)}")
@@ -8267,15 +8655,13 @@ class AIAgent:
                     store=self._memory_store,
                 )
                 # Bridge: notify external memory provider of built-in memory writes
-                if self._memory_manager and function_args.get("action") in ("add", "replace"):
-                    try:
-                        self._memory_manager.on_memory_write(
-                            function_args.get("action", ""),
-                            target,
-                            function_args.get("content", ""),
-                        )
-                    except Exception:
-                        pass
+                self._bridge_memory_write(
+                    action=function_args.get("action", ""),
+                    target=target,
+                    content=function_args.get("content"),
+                    old_text=function_args.get("old_text"),
+                    tool_result=function_result,
+                )
                 tool_duration = time.time() - tool_start_time
                 if self._should_emit_quiet_tool_messages():
                     self._vprint(f"  {_get_cute_tool_message_impl('memory', function_args, tool_duration, result=function_result)}")
@@ -8378,6 +8764,7 @@ class AIAgent:
                     spinner = KawaiiSpinner(f"{face} {emoji} {preview}", spinner_type='dots', print_fn=self._print_fn)
                     spinner.start()
                 _spinner_result = None
+                invoke_post_tool_hook = False
                 try:
                     function_result = handle_function_call(
                         function_name, function_args, effective_task_id,
@@ -8398,6 +8785,8 @@ class AIAgent:
                     elif self._should_emit_quiet_tool_messages():
                         self._vprint(f"  {cute_msg}")
             else:
+                invoke_post_tool_hook = False
+
                 try:
                     function_result = handle_function_call(
                         function_name, function_args, effective_task_id,
@@ -8444,6 +8833,17 @@ class AIAgent:
                     self.tool_complete_callback(tool_call.id, function_name, function_args, function_result)
                 except Exception as cb_err:
                     logging.debug(f"Tool complete callback error: {cb_err}")
+            self._emit_post_tool_signal(
+                function_name=function_name,
+                function_args=function_args,
+                function_result=function_result,
+                effective_task_id=effective_task_id,
+                tool_call_id=tool_call.id,
+                phase="blocked" if _block_msg is not None else ("failed" if _is_error_result else "completed"),
+                tool_duration=tool_duration,
+                blocked_message=_block_msg,
+                invoke_hook=invoke_post_tool_hook,
+            )
 
             function_result = maybe_persist_tool_result(
                 content=function_result,
@@ -8853,16 +9253,25 @@ class AIAgent:
                 # Fired once when a brand-new session is created (not on
                 # continuation).  Plugins can use this to initialise
                 # session-scoped state (e.g. warm a memory cache).
-                try:
-                    from hermes_cli.plugins import invoke_hook as _invoke_hook
-                    _invoke_hook(
-                        "on_session_start",
-                        session_id=self.session_id,
-                        model=self.model,
-                        platform=getattr(self, "platform", None) or "",
-                    )
-                except Exception as exc:
-                    logger.warning("on_session_start hook failed: %s", exc)
+                self._emit_runtime_signal(
+                    event_type="session.lifecycle",
+                    phase="started",
+                    correlation_id=self.session_id or str(uuid.uuid4()),
+                    mission_id=self._current_mission_id(),
+                    idempotency_key=f"session.lifecycle:{self.session_id or 'missing-session'}:started",
+                    payload={
+                        "model": self.model,
+                        "platform": getattr(self, "platform", None) or "",
+                        "new_session": True,
+                    },
+                    subject=self._runtime_signal_subject("session", self.session_id or None),
+                    hook_name="on_session_start",
+                    hook_kwargs={
+                        "session_id": self.session_id,
+                        "model": self.model,
+                        "platform": getattr(self, "platform", None) or "",
+                    },
+                )
 
                 # Store the system prompt snapshot in SQLite
                 if self._session_db:
@@ -8872,7 +9281,8 @@ class AIAgent:
                         logger.debug("Session DB update_system_prompt failed: %s", e)
 
         active_system_prompt = self._cached_system_prompt
-
+        _llm_signal_correlation_id = f"{self.session_id or 'sessionless'}:llm:{uuid.uuid4().hex}"
+        _api_request_signal_correlation_id: Optional[str] = None
         # ── Preflight context compression ──
         # Before entering the main loop, check if the loaded conversation
         # history already exceeds the model's context threshold.  This handles
@@ -8942,11 +9352,10 @@ class AIAgent:
                         break  # Under threshold
 
         # Plugin hook: pre_llm_call
-        # Fired once per turn before the tool-calling loop.  Plugins can
-        # return a dict with a ``context`` key (or a plain string) whose
-        # value is appended to the current turn's user message.
-        #
-        # Context is ALWAYS injected into the user message, never the
+        # Fired once per turn before the tool-calling loop. Plugins receive
+        # sanitized request metadata and may return a dict with a ``context``
+        # key (or a plain string) whose value is appended to the current turn's
+        # user message.
         # system prompt.  This preserves the prompt cache prefix — the
         # system prompt stays identical across turns so cached tokens
         # are reused.  The system prompt is Hermes's territory; plugins
@@ -8954,28 +9363,42 @@ class AIAgent:
         #
         # All injected context is ephemeral (not persisted to session DB).
         _plugin_user_context = ""
-        try:
-            from hermes_cli.plugins import invoke_hook as _invoke_hook
-            _pre_results = _invoke_hook(
-                "pre_llm_call",
-                session_id=self.session_id,
-                user_message=original_user_message,
-                conversation_history=list(messages),
-                is_first_turn=(not bool(conversation_history)),
-                model=self.model,
-                platform=getattr(self, "platform", None) or "",
-                sender_id=getattr(self, "_user_id", None) or "",
-            )
-            _ctx_parts: list[str] = []
-            for r in _pre_results:
-                if isinstance(r, dict) and r.get("context"):
-                    _ctx_parts.append(str(r["context"]))
-                elif isinstance(r, str) and r.strip():
-                    _ctx_parts.append(r)
-            if _ctx_parts:
-                _plugin_user_context = "\n\n".join(_ctx_parts)
-        except Exception as exc:
-            logger.warning("pre_llm_call hook failed: %s", exc)
+        _pre_llm_hook_kwargs = {
+            "session_id": self.session_id,
+            "is_first_turn": (not bool(conversation_history)),
+            "model": self.model,
+            "platform": getattr(self, "platform", None) or "",
+            "sender_id_present": bool(getattr(self, "_user_id", None)),
+            "user_message_chars": len(original_user_message or ""),
+            "conversation_history_length": len(messages),
+        }
+        _pre_results = self._emit_runtime_signal(
+            event_type="llm.call",
+            phase="requested",
+            correlation_id=_llm_signal_correlation_id,
+            mission_id=self._current_mission_id(),
+            idempotency_key=f"{_llm_signal_correlation_id}:requested",
+            payload={
+                "user_message_chars": len(original_user_message or ""),
+                "history_length": len(messages),
+                "is_first_turn": (not bool(conversation_history)),
+                "model": self.model,
+                "platform": getattr(self, "platform", None) or "",
+                "sender_id_present": bool(getattr(self, "_user_id", None)),
+            },
+            subject=self._runtime_signal_subject("model", self.model),
+            hook_name="pre_llm_call",
+            hook_kwargs=_pre_llm_hook_kwargs,
+            hook_failure_result=[],
+        )
+        _ctx_parts: list[str] = []
+        for r in _pre_results:
+            if isinstance(r, dict) and r.get("context"):
+                _ctx_parts.append(str(r["context"]))
+            elif isinstance(r, str) and r.strip():
+                _ctx_parts.append(r)
+        if _ctx_parts:
+            _plugin_user_context = "\n\n".join(_ctx_parts)
 
         # Main conversation loop
         api_call_count = 0
@@ -9317,26 +9740,35 @@ class AIAgent:
                     if self.api_mode == "codex_responses":
                         api_kwargs = self._preflight_codex_api_kwargs(api_kwargs, allow_stream=False)
 
-                    try:
-                        from hermes_cli.plugins import invoke_hook as _invoke_hook
-                        _invoke_hook(
-                            "pre_api_request",
-                            task_id=effective_task_id,
-                            session_id=self.session_id or "",
-                            platform=self.platform or "",
-                            model=self.model,
-                            provider=self.provider,
-                            base_url=self.base_url,
-                            api_mode=self.api_mode,
-                            api_call_count=api_call_count,
-                            message_count=len(api_messages),
-                            tool_count=len(self.tools or []),
-                            approx_input_tokens=approx_tokens,
-                            request_char_count=total_chars,
-                            max_tokens=self.max_tokens,
-                        )
-                    except Exception:
-                        pass
+                    _api_request_signal_correlation_id = f"{_llm_signal_correlation_id}:api:{api_call_count}"
+                    _pre_api_hook_kwargs = {
+                        "task_id": effective_task_id,
+                        "session_id": self.session_id or "",
+                        "platform": self.platform or "",
+                        "model": self.model,
+                        "provider": self.provider,
+                        "base_url": self._safe_base_url_for_signal(self.base_url),
+                        "api_mode": self.api_mode,
+                        "api_call_count": api_call_count,
+                        "message_count": len(api_messages),
+                        "tool_count": len(self.tools or []),
+                        "approx_input_tokens": approx_tokens,
+                        "request_char_count": total_chars,
+                        "max_tokens": self.max_tokens,
+                    }
+                    self._emit_runtime_signal(
+                        event_type="api.request",
+                        phase="requested",
+                        correlation_id=_api_request_signal_correlation_id,
+                        mission_id=self._current_mission_id(),
+                        idempotency_key=f"{_api_request_signal_correlation_id}:requested",
+                        payload=_pre_api_hook_kwargs,
+                        subject=self._runtime_signal_subject("model", self.model),
+                        hook_name="pre_api_request",
+                        hook_kwargs=_pre_api_hook_kwargs,
+                        hook_failure_result=[],
+                        hook_failure_log_level="debug",
+                    )
 
                     if env_var_enabled("HERMES_DUMP_REQUESTS"):
                         self._dump_api_request_debug(api_kwargs, reason="preflight")
@@ -10621,6 +11053,13 @@ class AIAgent:
                             compression_attempts = 0
                             primary_recovery_attempted = False
                             continue
+                        self._emit_terminal_request_failures(
+                            llm_correlation_id=_llm_signal_correlation_id,
+                            api_correlation_id=_api_request_signal_correlation_id,
+                            effective_task_id=effective_task_id,
+                            api_call_count=api_call_count,
+                            error_summary=api_error,
+                        )
                         if api_kwargs is not None:
                             self._dump_api_request_debug(
                                 api_kwargs, reason="non_retryable_client_error", error=api_error,
@@ -10688,6 +11127,13 @@ class AIAgent:
                             compression_attempts = 0
                             primary_recovery_attempted = False
                             continue
+                        self._emit_terminal_request_failures(
+                            llm_correlation_id=_llm_signal_correlation_id,
+                            api_correlation_id=_api_request_signal_correlation_id,
+                            effective_task_id=effective_task_id,
+                            api_call_count=api_call_count,
+                            error_summary=api_error,
+                        )
                         _final_summary = self._summarize_api_error(api_error)
                         if is_rate_limited:
                             self._emit_status(f"❌ Rate limited after {max_retries} retries — {_final_summary}")
@@ -10868,30 +11314,37 @@ class AIAgent:
                     else:
                         assistant_message.content = str(raw)
 
-                try:
-                    from hermes_cli.plugins import invoke_hook as _invoke_hook
-                    _assistant_tool_calls = getattr(assistant_message, "tool_calls", None) or []
-                    _assistant_text = assistant_message.content or ""
-                    _invoke_hook(
-                        "post_api_request",
-                        task_id=effective_task_id,
-                        session_id=self.session_id or "",
-                        platform=self.platform or "",
-                        model=self.model,
-                        provider=self.provider,
-                        base_url=self.base_url,
-                        api_mode=self.api_mode,
-                        api_call_count=api_call_count,
-                        api_duration=api_duration,
-                        finish_reason=finish_reason,
-                        message_count=len(api_messages),
-                        response_model=getattr(response, "model", None),
-                        usage=self._usage_summary_for_api_request_hook(response),
-                        assistant_content_chars=len(_assistant_text),
-                        assistant_tool_call_count=len(_assistant_tool_calls),
-                    )
-                except Exception:
-                    pass
+                _assistant_tool_calls = getattr(assistant_message, "tool_calls", None) or []
+                _assistant_text = assistant_message.content or ""
+                _post_api_hook_kwargs = {
+                    "task_id": effective_task_id,
+                    "session_id": self.session_id or "",
+                    "platform": self.platform or "",
+                    "model": self.model,
+                    "provider": self.provider,
+                    "base_url": self._safe_base_url_for_signal(self.base_url),
+                    "api_mode": self.api_mode,
+                    "api_call_count": api_call_count,
+                    "api_duration": api_duration,
+                    "finish_reason": finish_reason,
+                    "message_count": len(api_messages),
+                    "response_model": getattr(response, "model", None),
+                    "usage": self._usage_summary_for_api_request_hook(response),
+                    "assistant_content_chars": len(_assistant_text),
+                    "assistant_tool_call_count": len(_assistant_tool_calls),
+                }
+                self._emit_runtime_signal(
+                    event_type="api.request",
+                    phase="completed",
+                    correlation_id=_api_request_signal_correlation_id,
+                    mission_id=self._current_mission_id(),
+                    idempotency_key=f"{_api_request_signal_correlation_id}:completed",
+                    payload=_post_api_hook_kwargs,
+                    subject=self._runtime_signal_subject("model", self.model),
+                    hook_name="post_api_request",
+                    hook_kwargs=_post_api_hook_kwargs,
+                    hook_failure_log_level="debug",
+                )
 
                 # Handle assistant response
                 if assistant_message.content and not self.quiet_mode:
@@ -11644,6 +12097,13 @@ class AIAgent:
 
                 # If we're near the limit, break to avoid infinite loops
                 if api_call_count >= self.max_iterations - 1:
+                    self._emit_terminal_request_failures(
+                        llm_correlation_id=_llm_signal_correlation_id,
+                        api_correlation_id=_api_request_signal_correlation_id,
+                        effective_task_id=effective_task_id,
+                        api_call_count=api_call_count,
+                        error_summary=e,
+                    )
                     _turn_exit_reason = f"error_near_max_iterations({error_msg[:80]})"
                     final_response = f"I apologize, but I encountered repeated errors: {error_msg}"
                     # Append as assistant so the history stays valid for
@@ -11727,23 +12187,35 @@ class AIAgent:
             logger.info(_diag_msg, *_diag_args)
 
         # Plugin hook: post_llm_call
-        # Fired once per turn after the tool-calling loop completes.
-        # Plugins can use this to persist conversation data (e.g. sync
-        # to an external memory system).
+        # Fired once per turn after the tool-calling loop completes. Plugins
+        # receive sanitized metadata-only payloads for this hook, not raw
+        # prompts or responses.
         if final_response and not interrupted:
-            try:
-                from hermes_cli.plugins import invoke_hook as _invoke_hook
-                _invoke_hook(
-                    "post_llm_call",
-                    session_id=self.session_id,
-                    user_message=original_user_message,
-                    assistant_response=final_response,
-                    conversation_history=list(messages),
-                    model=self.model,
-                    platform=getattr(self, "platform", None) or "",
-                )
-            except Exception as exc:
-                logger.warning("post_llm_call hook failed: %s", exc)
+            _post_llm_hook_kwargs = {
+                "session_id": self.session_id,
+                "model": self.model,
+                "platform": getattr(self, "platform", None) or "",
+                "sender_id_present": bool(getattr(self, "_user_id", None)),
+                "user_message_chars": len(original_user_message or ""),
+                "assistant_response_chars": len(final_response or ""),
+                "conversation_history_length": len(messages),
+            }
+            self._emit_runtime_signal(
+                event_type="llm.call",
+                phase="completed",
+                correlation_id=_llm_signal_correlation_id,
+                mission_id=self._current_mission_id(),
+                idempotency_key=f"{_llm_signal_correlation_id}:completed",
+                payload={
+                    "assistant_response_chars": len(final_response),
+                    "history_length": len(messages),
+                    "model": self.model,
+                    "platform": getattr(self, "platform", None) or "",
+                },
+                subject=self._runtime_signal_subject("model", self.model),
+                hook_name="post_llm_call",
+                hook_kwargs=_post_llm_hook_kwargs,
+            )
 
         # Extract reasoning from the last assistant message (if any)
         last_reasoning = None

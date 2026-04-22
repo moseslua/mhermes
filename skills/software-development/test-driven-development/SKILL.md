@@ -96,8 +96,8 @@ Vague name, tests mock not real code.
 **MANDATORY. Never skip.**
 
 ```bash
-# Use terminal tool to run the specific test
-pytest tests/test_feature.py::test_specific_behavior -v
+# Use the project's test entrypoint to run the specific failing case
+<project test command for this case>
 ```
 
 Confirm:
@@ -143,10 +143,10 @@ We'll fix it in REFACTOR.
 
 ```bash
 # Run the specific test
-pytest tests/test_feature.py::test_specific_behavior -v
+<project test command for this test>
 
-# Then run ALL tests to check for regressions
-pytest tests/ -q
+# Then run the project's broader regression command
+<project regression command>
 ```
 
 Confirm:
@@ -287,13 +287,13 @@ Use the `terminal` tool to run tests at each step:
 
 ```python
 # RED — verify failure
-terminal("pytest tests/test_feature.py::test_name -v")
+terminal("<project test command for this case>")
 
 # GREEN — verify pass
-terminal("pytest tests/test_feature.py::test_name -v")
+terminal("<project test command for this case>")
 
-# Full suite — verify no regressions
-terminal("pytest tests/ -q")
+# Broader regression check
+terminal("<project broader regression command>")
 ```
 
 ### With delegate_task
@@ -312,7 +312,7 @@ delegate_task(
     5. Refactor if needed
     6. Commit
 
-    Project test command: pytest tests/ -q
+    Project test command: [project wrapper or repo-standard test command]
     Project structure: [describe relevant files]
     """,
     toolsets=['terminal', 'file']

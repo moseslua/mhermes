@@ -18,6 +18,37 @@ We value contributions in this order:
 
 ---
 
+## AI-First Engineering
+
+> See also: [`docs/specs/ai-first-engineering-workflow.md`](docs/specs/ai-first-engineering-workflow.md)
+
+> Hermes is increasingly built and maintained with AI-assisted code generation. That raises the bar for planning, verification, and review — it does not lower it.
+
+### Working rules
+
+- **Plan before non-trivial implementation.** If a change touches multiple files, alters behavior, or crosses an interface boundary, start from an explicit plan with acceptance criteria, risks, and verification steps.
+- **Evidence beats anecdotes.** "It worked locally" is not sufficient when targeted deterministic tests or evals are available.
+- **Review behavior, not cosmetics.** Prioritize behavior regressions, security assumptions, data integrity, failure handling, rollout safety, and compatibility with existing callers over style nits already handled by automation.
+- **Generated code needs regression proof.** If AI-generated output changes a behavior, add or update regression coverage for the touched domain. Include explicit edge-case assertions and focused integration checks when a module boundary is crossed.
+- **Keep boundaries explicit.** Prefer stable contracts, typed interfaces, and deterministic tests over hidden conventions or implicit behavior spread across multiple files.
+- **Keep volatile workflow policy out of the cached prompt prefix.** Contributor-process rules belong in docs, templates, and on-demand skills — not in stable runtime prompt layers that would hurt prompt caching.
+
+### Choosing verification depth
+
+Use the lightest proof that can falsify a bad change:
+
+| Surface touched | Required proof | Optional escalation |
+|---|---|---|
+| Docs / process only | targeted manual review; no behavior change | none |
+| Planning / review skills | targeted deterministic tests for affected slash or skill paths | manual skill-path sanity check |
+| Prompt / memory / caching | targeted regression tests + compatibility checks | TBLite subset |
+| Tool / gateway / TUI contracts | boundary tests + focused integration checks | TBLite or TB2 subset |
+| Benchmarks / environments | benchmark-specific validation notes | full benchmark run |
+
+When in doubt, choose the smaller deterministic regression bundle first, then escalate only if the touched surface justifies it.
+
+---
+
 ## Should it be a Skill or a Tool?
 
 This is the most common question for new contributors. The answer is almost always **skill**.
@@ -105,9 +136,24 @@ hermes chat -q "Hello"
 
 ### Run tests
 
+Use the canonical wrapper instead of calling `pytest` directly. It matches CI behavior closely, enforces the repo's hermetic test invariants, and runs the default non-integration Python suite.
+
 ```bash
-pytest tests/ -v
+scripts/run_tests.sh                     # default Python suite (excludes integration/e2e)
+scripts/run_tests.sh tests/agent/        # one directory
+scripts/run_tests.sh tests/agent/test_foo.py::test_bar
 ```
+
+If you need integration or e2e coverage, run those explicitly in addition to the wrapper. If you intentionally run a narrower command than the default suite, record the exact command in your PR's verification evidence.
+
+Use these direct pytest commands only for the suites the wrapper intentionally excludes:
+
+```bash
+source venv/bin/activate
+python -m pytest -o "addopts=" tests/integration/ -q -n 4
+python -m pytest -o "addopts=" tests/e2e/ -q -n 4
+```
+
 
 ---
 
@@ -595,7 +641,7 @@ refactor/description   # Code restructuring
 
 ### Before submitting
 
-1. **Run tests**: `pytest tests/ -v`
+1. **Run tests**: `scripts/run_tests.sh` or a narrower command that you can justify in the PR; add integration/e2e coverage separately when your change touches those paths
 2. **Test manually**: Run `hermes` and exercise the code path you changed
 3. **Check cross-platform impact**: If you touch file I/O, process management, or terminal handling, consider Windows and macOS
 4. **Keep PRs focused**: One logical change per PR. Don't mix a bug fix with a refactor with a new feature.

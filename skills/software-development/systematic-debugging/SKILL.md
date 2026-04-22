@@ -80,10 +80,10 @@ You MUST complete each phase before proceeding to the next.
 
 ```bash
 # Run specific failing test
-pytest tests/test_module.py::test_name -v
+<project test command for this failure>
 
-# Run with verbose output
-pytest tests/test_module.py -v --tb=long
+# Run with more detail when needed
+<project verbose test command>
 ```
 
 ### 3. Check Recent Changes
@@ -241,10 +241,10 @@ search_files("similar_pattern", path="src/", file_glob="*.py")
 
 ```bash
 # Run the specific regression test
-pytest tests/test_module.py::test_regression -v
+<project regression command for this case>
 
-# Run full suite — no regressions
-pytest tests/ -q
+# Run the project's broader regression command
+<project regression command>
 ```
 
 ### 4. If Fix Doesn't Work — The Rule of Three

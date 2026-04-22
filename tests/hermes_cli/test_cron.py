@@ -105,3 +105,50 @@ class TestCronCommandLifecycle:
         assert len(jobs) == 1
         assert jobs[0]["skills"] == ["blogwatcher", "maps"]
         assert jobs[0]["name"] == "Skill combo"
+
+    def test_create_reactive_only_job_with_prompt_positionals(self, tmp_cron_dir, capsys):
+        source = create_job(prompt="Source", schedule="every 1h")
+
+        cron_command(
+            Namespace(
+                cron_command="create",
+                schedule="Repair the failing source job",
+                prompt=None,
+                name="Repair job",
+                deliver=None,
+                repeat=None,
+                skill=None,
+                skills=None,
+                script=None,
+                trigger_job_id=source["id"],
+                trigger_after_failures=2,
+                reactive_only=True,
+            )
+        )
+
+        out = capsys.readouterr().out
+        assert "Created job" in out
+        jobs = list_jobs()
+        repair = [job for job in jobs if job["id"] != source["id"]][0]
+        assert repair["schedule"] is None
+        assert repair["reactive_trigger"]["job_id"] == source["id"]
+
+    def test_list_shows_health_and_reactive_trigger(self, tmp_cron_dir, capsys):
+        source = create_job(prompt="Source", schedule="every 1h", name="Source")
+        repair = create_job(
+            prompt="Repair",
+            reactive_trigger={
+                "job_id": source["id"],
+                "after_consecutive_failures": 2,
+            },
+            name="Repair",
+        )
+
+        from cron.jobs import mark_job_run
+        mark_job_run(source["id"], success=False, error="boom")
+
+        cron_command(Namespace(cron_command="list", all=False))
+        out = capsys.readouterr().out
+        assert "Reactive:" in out
+        assert repair["id"] in out
+        assert "Health:" in out
