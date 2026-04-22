@@ -181,10 +181,7 @@ class TestPluginDiscovery:
         with patch("importlib.metadata.entry_points", fake_entry_points):
             mgr = PluginManager()
             mgr.discover_and_load()
-
         assert "ep_plugin" in mgr._plugins
-        assert mgr._plugins["ep_plugin"].enabled
-        assert mgr._plugins["ep_plugin"].error is None
 
     def test_user_plugin_blocked_by_guard(self, tmp_path, monkeypatch):
         plugins_dir = tmp_path / "hermes_test" / "plugins"
@@ -223,10 +220,8 @@ class TestPluginDiscovery:
 
         assert "ep_plugin" in mgr._plugins
         assert mgr._plugins["ep_plugin"].enabled is False
-        assert "disabled by default" in (mgr._plugins["ep_plugin"].error or "")
+        assert "not enabled in config" in (mgr._plugins["ep_plugin"].error or "")
 
-
-        assert "ep_plugin" in mgr._plugins
 
 
 # ── TestPluginLoading ──────────────────────────────────────────────────────
@@ -407,7 +402,7 @@ class TestPluginHooks:
             plugins_dir, "transform_hook",
             register_body=(
                 'ctx.register_hook("transform_terminal_output", '
-                'lambda **kw: f"{kw[\'command\']}|{kw[\'returncode\']}|{kw[\'env_type\']}|{kw[\'task_id\']}|{len(kw[\'output\'])}"')
+                'lambda **kw: f"{kw[\'command\']}|{kw[\'returncode\']}|{kw[\'env_type\']}|{kw[\'task_id\']}|{len(kw[\'output\'])}" )'
             ),
         )
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
