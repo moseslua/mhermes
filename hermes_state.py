@@ -32,7 +32,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -192,6 +192,100 @@ CREATE TABLE IF NOT EXISTS mission_checkpoints (
     updated_at REAL NOT NULL
  );
 CREATE INDEX IF NOT EXISTS idx_mission_checkpoints_mission ON mission_checkpoints(mission_id, checkpoint_type, created_at);
+"""
+
+
+DOMAIN_STATE_SQL = """
+CREATE TABLE IF NOT EXISTS approvals (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    request_type TEXT NOT NULL,
+    requested_at REAL NOT NULL,
+    approved_at REAL,
+    approved_by TEXT,
+    status TEXT NOT NULL,
+    payload_json TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+ );
+CREATE INDEX IF NOT EXISTS idx_approvals_session ON approvals(session_id, status, created_at);
+
+
+CREATE TABLE IF NOT EXISTS proposals (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    proposal_type TEXT NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT,
+    status TEXT NOT NULL,
+    scaffold_path TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    reviewed_at REAL
+ );
+CREATE INDEX IF NOT EXISTS idx_proposals_session ON proposals(session_id, status, created_at);
+
+
+CREATE TABLE IF NOT EXISTS model_mutations (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    key TEXT NOT NULL,
+    old_value TEXT,
+    new_value TEXT NOT NULL,
+    requested_at REAL NOT NULL,
+    approved_at REAL,
+    status TEXT NOT NULL,
+    rollback_value TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+ );
+CREATE INDEX IF NOT EXISTS idx_model_mutations_session ON model_mutations(session_id, status, created_at);
+
+
+CREATE TABLE IF NOT EXISTS learning_exports (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    export_type TEXT NOT NULL,
+    path TEXT,
+    status TEXT NOT NULL,
+    result_json TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+ );
+CREATE INDEX IF NOT EXISTS idx_learning_exports_session ON learning_exports(session_id, status, created_at);
+
+
+CREATE TABLE IF NOT EXISTS eval_runs (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    eval_type TEXT NOT NULL,
+    result_json TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+ );
+CREATE INDEX IF NOT EXISTS idx_eval_runs_session ON eval_runs(session_id, eval_type, created_at);
+
+
+CREATE TABLE IF NOT EXISTS projection_cursors (
+    id TEXT PRIMARY KEY,
+    projection_type TEXT NOT NULL UNIQUE,
+    last_applied_audit_id INTEGER,
+    last_snapshot_hash TEXT,
+    last_projection_version INTEGER DEFAULT 0,
+    updated_at REAL NOT NULL
+ );
+CREATE INDEX IF NOT EXISTS idx_projection_cursors_type ON projection_cursors(projection_type);
+
+
+CREATE TABLE IF NOT EXISTS analytics_rollups (
+    id TEXT PRIMARY KEY,
+    rollup_type TEXT NOT NULL,
+    period_start REAL NOT NULL,
+    period_end REAL NOT NULL,
+    data_json TEXT NOT NULL,
+    created_at REAL NOT NULL
+ );
+CREATE INDEX IF NOT EXISTS idx_analytics_rollups_type_period ON analytics_rollups(rollup_type, period_start DESC);
 """
 
 FTS_SQL = """
@@ -359,7 +453,7 @@ class SessionDB:
 
         cursor.executescript(SCHEMA_SQL)
         cursor.executescript(RUNTIME_SIGNAL_AUDIT_SQL)
-        cursor.executescript(MISSION_STATE_SQL)
+        cursor.executescript(DOMAIN_STATE_SQL)
         # Check schema version and run migrations
         cursor.execute("SELECT version FROM schema_version LIMIT 1")
         row = cursor.fetchone()
@@ -463,6 +557,12 @@ class SessionDB:
                     "CREATE INDEX IF NOT EXISTS idx_sessions_attached_mission ON sessions(attached_mission_id)"
                 )
                 cursor.execute("UPDATE schema_version SET version = 8")
+
+            if current_version < 9:
+                # v9: add authoritative domain tables for proposals, model mutations,
+                # learning exports, eval runs, projection cursors, and analytics rollups.
+                cursor.executescript(DOMAIN_STATE_SQL)
+                cursor.execute("UPDATE schema_version SET version = 9")
 
         try:
             cursor.execute(
