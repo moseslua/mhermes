@@ -800,22 +800,31 @@ def text_to_speech_tool(
     from gateway.session_context import get_session_env
     platform = get_session_env("HERMES_SESSION_PLATFORM", "").lower()
     want_opus = (platform == "telegram")
+    cron_session = get_session_env("HERMES_CRON_SESSION", "") == "1"
+    model_facing_session = cron_session or bool(
+        get_session_env("HERMES_SESSION_PLATFORM", "")
+        or get_session_env("HERMES_SESSION_KEY", "")
+    )
 
     # Determine output path
     if output_path:
+        if model_facing_session:
+            return json.dumps({
+                "success": False,
+                "error": "Custom output_path is not allowed in agent sessions.",
+            }, ensure_ascii=False)
         file_path = Path(output_path).expanduser()
     else:
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         out_dir = Path(DEFAULT_OUTPUT_DIR)
         out_dir.mkdir(parents=True, exist_ok=True)
+        unique_suffix = uuid.uuid4().hex[:8]
         # Use .ogg for Telegram with providers that support native Opus output,
         # otherwise fall back to .mp3 (Edge TTS will attempt ffmpeg conversion later).
         if want_opus and provider in ("openai", "elevenlabs", "mistral", "gemini"):
-            file_path = out_dir / f"tts_{timestamp}.ogg"
+            file_path = out_dir / f"tts_{timestamp}_{unique_suffix}.ogg"
         else:
-            file_path = out_dir / f"tts_{timestamp}.mp3"
-
-    # Ensure parent directory exists
+            file_path = out_dir / f"tts_{timestamp}_{unique_suffix}.mp3"
     file_path.parent.mkdir(parents=True, exist_ok=True)
     file_str = str(file_path)
 
@@ -925,8 +934,9 @@ def text_to_speech_tool(
             voice_compatible = file_str.endswith(".ogg")
 
         file_size = os.path.getsize(file_str)
+        from gateway.session_context import register_session_attachment_path
+        register_session_attachment_path(file_str)
         logger.info("TTS audio saved: %s (%s bytes, provider: %s)", file_str, f"{file_size:,}", provider)
-
         # Build response with MEDIA tag for platform delivery
         media_tag = f"MEDIA:{file_str}"
         if voice_compatible:

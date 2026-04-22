@@ -1,0 +1,10 @@
+{
+  "active": false,
+  "iteration": 3,
+  "max_iterations": 3,
+  "current_phase": "P3-U1 complete",
+  "task_description": "Implement Phase 3 unit P3-U1 canonical shared-memory service and read APIs",
+  "started_at": "2026-04-20T00:00:00Z",
+  "completed_at": "2026-04-20T00:00:00Z",
+  "error": ""
+}

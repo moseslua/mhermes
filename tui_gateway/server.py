@@ -1364,6 +1364,8 @@ def _(rid, params: dict) -> dict:
             current = db.get_session_title(old_key) or "branch"
             title = db.get_next_title_in_lineage(current) if hasattr(db, "get_next_title_in_lineage") else f"{current} (branch)"
         db.create_session(new_key, source="tui", model=_resolve_model(), parent_session_id=old_key)
+        from agent.mission_state import MissionService
+        MissionService(db).clone_session_work_context(old_key, new_key)
         for msg in history:
             db.append_message(session_id=new_key, role=msg.get("role", "user"), content=msg.get("content"))
         db.set_session_title(new_key, title)
@@ -2123,8 +2125,8 @@ def _(rid, params: dict) -> dict:
 
         skill_count = 0
         try:
-            from agent.skill_commands import scan_skill_commands
-            for k, info in sorted(scan_skill_commands().items()):
+            from agent.skill_commands import get_skill_commands
+            for k, info in sorted(get_skill_commands().items()):
                 d = str(info.get("description", "Skill"))
                 all_pairs.append([k, d[:120] + ("…" if len(d) > 120 else "")])
                 skill_count += 1
@@ -2240,8 +2242,8 @@ def _(rid, params: dict) -> dict:
         pass
 
     try:
-        from agent.skill_commands import scan_skill_commands, build_skill_invocation_message
-        cmds = scan_skill_commands()
+        from agent.skill_commands import get_skill_commands, build_skill_invocation_message
+        cmds = get_skill_commands()
         key = f"/{name}"
         if key in cmds:
             msg = build_skill_invocation_message(key, arg, task_id=session.get("session_key", "") if session else "")

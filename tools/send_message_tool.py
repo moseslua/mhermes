@@ -10,9 +10,11 @@ import json
 import logging
 import os
 import re
-from typing import Dict, Optional
 import ssl
+import tempfile
 import time
+from pathlib import Path
+from typing import Dict, Optional
 
 from agent.redact import redact_sensitive_text
 
@@ -21,6 +23,7 @@ logger = logging.getLogger(__name__)
 _TELEGRAM_TOPIC_TARGET_RE = re.compile(r"^\s*(-?\d+)(?::(\d+))?\s*$")
 _FEISHU_TARGET_RE = re.compile(r"^\s*((?:oc|ou|on|chat|open)_[-A-Za-z0-9]+)(?::([-A-Za-z0-9_]+))?\s*$")
 _WEIXIN_TARGET_RE = re.compile(r"^\s*((?:wxid|gh|v\d+|wm|wb)_[A-Za-z0-9_-]+|[A-Za-z0-9._-]+@chatroom|filehelper)\s*$")
+_MATRIX_TARGET_RE = re.compile(r"^\s*([!#][^:\s]+:[^\s]+)\s*$")
 # Discord snowflake IDs are numeric, same regex pattern as Telegram topic targets.
 _NUMERIC_TOPIC_RE = _TELEGRAM_TOPIC_TARGET_RE
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
@@ -48,6 +51,30 @@ def _sanitize_error_text(text) -> str:
 def _error(message: str) -> dict:
     """Build a standardized error payload with redacted content."""
     return {"error": _sanitize_error_text(message)}
+
+def _runtime_env(name: str, default: str = "") -> str:
+    from gateway.config import _session_env
+    return _session_env(name, default)
+
+
+def _validate_media_path(media_path: str) -> Optional[str]:
+    from gateway.session_context import is_session_attachment_path_allowed
+
+    resolved = Path(media_path).expanduser().resolve()
+    if resolved.exists() and not resolved.is_file():
+        return f"Blocked media attachment path is not a regular file: {media_path}"
+    if is_session_attachment_path_allowed(media_path):
+        return None
+    return f"Blocked media attachment path not registered for this run: {media_path}"
+
+
+def _validate_media_files(media_files) -> Optional[str]:
+    for media_path, _is_voice in media_files or []:
+        error = _validate_media_path(media_path)
+        if error:
+            return error
+    return None
+
 
 
 def _telegram_retry_delay(exc: Exception, attempt: int) -> float | None:
@@ -113,7 +140,7 @@ SEND_MESSAGE_SCHEMA = {
             },
             "target": {
                 "type": "string",
-                "description": "Delivery target. Format: 'platform' (uses home channel), 'platform:#channel-name', 'platform:chat_id', or 'platform:chat_id:thread_id' for Telegram topics and Discord threads. Examples: 'telegram', 'telegram:-1001234567890:17585', 'discord:999888777:555444333', 'discord:#bot-home', 'slack:#engineering', 'signal:+155****4567', 'matrix:!roomid:server.org', 'matrix:@user:server.org'"
+                "description": "Delivery target. Format: 'platform' (uses home channel), 'platform:#channel-name', 'platform:chat_id', or 'platform:chat_id:thread_id' for Telegram topics and Discord threads. Examples: 'telegram', 'telegram:-1001234567890:17585', 'discord:999888777:555444333', 'discord:#bot-home', 'slack:#engineering', 'signal:+155****4567', 'matrix:!roomid:server.org'"
             },
             "message": {
                 "type": "string",
@@ -168,7 +195,11 @@ def _handle_send(args):
             from gateway.channel_directory import resolve_channel_name
             resolved = resolve_channel_name(platform_name, target_ref)
             if resolved:
-                chat_id, thread_id, _ = _parse_target_ref(platform_name, resolved)
+                parsed_chat_id, parsed_thread_id, resolved_is_explicit = _parse_target_ref(platform_name, resolved)
+                if resolved_is_explicit:
+                    chat_id, thread_id = parsed_chat_id, parsed_thread_id
+                else:
+                    chat_id = resolved
             else:
                 return json.dumps({
                     "error": f"Could not resolve '{target_ref}' on {platform_name}. "
@@ -220,8 +251,8 @@ def _handle_send(args):
         # send_message and cron delivery work without a gateway.yaml entry.
         if platform_name == "weixin":
             import os
-            wx_token = os.getenv("WEIXIN_TOKEN", "").strip()
-            wx_account = os.getenv("WEIXIN_ACCOUNT_ID", "").strip()
+            wx_token = _runtime_env("WEIXIN_TOKEN", "").strip()
+            wx_account = _runtime_env("WEIXIN_ACCOUNT_ID", "").strip()
             if wx_token and wx_account:
                 from gateway.config import PlatformConfig
                 pconfig = PlatformConfig(
@@ -229,8 +260,8 @@ def _handle_send(args):
                     token=wx_token,
                     extra={
                         "account_id": wx_account,
-                        "base_url": os.getenv("WEIXIN_BASE_URL", "").strip(),
-                        "cdn_base_url": os.getenv("WEIXIN_CDN_BASE_URL", "").strip(),
+                        "base_url": _runtime_env("WEIXIN_BASE_URL", "").strip(),
+                        "cdn_base_url": _runtime_env("WEIXIN_CDN_BASE_URL", "").strip(),
                     },
                 )
             else:
@@ -248,7 +279,7 @@ def _handle_send(args):
         home = config.get_home_channel(platform)
         if not home and platform_name == "weixin":
             import os
-            wx_home = os.getenv("WEIXIN_HOME_CHANNEL", "").strip()
+            wx_home = _runtime_env("WEIXIN_HOME_CHANNEL", "").strip()
             if wx_home:
                 from gateway.config import HomeChannel
                 home = HomeChannel(platform=platform, chat_id=wx_home, name="Weixin Home")
@@ -286,7 +317,7 @@ def _handle_send(args):
             try:
                 from gateway.mirror import mirror_to_session
                 from gateway.session_context import get_session_env
-                source_label = get_session_env("HERMES_SESSION_PLATFORM", "cli")
+                source_label = get_session_env("HERMES_SESSION_PLATFORM", "cli") or "cli"
                 if mirror_to_session(platform_name, chat_id, mirror_text, source_label=source_label, thread_id=thread_id):
                     result["mirrored"] = True
             except Exception:
@@ -317,11 +348,11 @@ def _parse_target_ref(platform_name: str, target_ref: str):
         match = _WEIXIN_TARGET_RE.fullmatch(target_ref)
         if match:
             return match.group(1), None, True
-    if target_ref.lstrip("-").isdigit():
+    if platform_name != "matrix" and target_ref.lstrip("-").isdigit():
         return target_ref, None, True
-    # Matrix room IDs (start with !) and user IDs (start with @) are explicit
-    if platform_name == "matrix" and (target_ref.startswith("!") or target_ref.startswith("@")):
-        return target_ref, None, True
+    match = _MATRIX_TARGET_RE.fullmatch(target_ref)
+    if platform_name == "matrix" and match:
+        return match.group(1), None, True
     return None, None, False
 
 
@@ -344,30 +375,57 @@ def _describe_media_for_mirror(media_files):
     return f"[Sent {len(media_files)} media attachments]"
 
 
+def _get_cron_auto_delivery_targets():
+    """Return all cron scheduler auto-delivery targets for the current run, if any."""
+    from gateway.session_context import get_session_env, get_session_env_overrides
+    job_id = get_session_env("HERMES_CRON_JOB_ID", "").strip()
+    if not job_id:
+        platform = get_session_env("HERMES_CRON_AUTO_DELIVER_PLATFORM", "").strip().lower()
+        chat_id = get_session_env("HERMES_CRON_AUTO_DELIVER_CHAT_ID", "").strip()
+        thread_id = get_session_env("HERMES_CRON_AUTO_DELIVER_THREAD_ID", "").strip() or None
+        if not platform or not chat_id:
+            return []
+        return [{"platform": platform, "chat_id": chat_id, "thread_id": thread_id}]
+    try:
+        from cron.jobs import get_job
+        from cron.scheduler import _resolve_delivery_targets
+        job = get_job(job_id)
+        if not job:
+            return []
+        targets = _resolve_delivery_targets(job, env_overrides=get_session_env_overrides())
+    except Exception:
+        targets = []
+    normalized = []
+    for target in targets or []:
+        platform = str(target.get("platform") or "").strip().lower()
+        chat_id = str(target.get("chat_id") or "").strip()
+        if not platform or not chat_id:
+            continue
+        normalized.append({
+            "platform": platform,
+            "chat_id": chat_id,
+            "thread_id": str(target.get("thread_id") or "").strip() or None,
+        })
+    return normalized
+
+
 def _get_cron_auto_delivery_target():
-    """Return the cron scheduler's auto-delivery target for the current run, if any."""
-    platform = os.getenv("HERMES_CRON_AUTO_DELIVER_PLATFORM", "").strip().lower()
-    chat_id = os.getenv("HERMES_CRON_AUTO_DELIVER_CHAT_ID", "").strip()
-    if not platform or not chat_id:
-        return None
-    thread_id = os.getenv("HERMES_CRON_AUTO_DELIVER_THREAD_ID", "").strip() or None
-    return {
-        "platform": platform,
-        "chat_id": chat_id,
-        "thread_id": thread_id,
-    }
+    """Return the cron scheduler's first auto-delivery target for the current run, if any."""
+    targets = _get_cron_auto_delivery_targets()
+    return targets[0] if targets else None
 
 
 def _maybe_skip_cron_duplicate_send(platform_name: str, chat_id: str, thread_id: str | None):
     """Skip redundant cron send_message calls when the scheduler will auto-deliver there."""
-    auto_target = _get_cron_auto_delivery_target()
-    if not auto_target:
+    auto_targets = _get_cron_auto_delivery_targets()
+    if not auto_targets:
         return None
 
-    same_target = (
-        auto_target["platform"] == platform_name
-        and str(auto_target["chat_id"]) == str(chat_id)
-        and auto_target.get("thread_id") == thread_id
+    same_target = any(
+        target["platform"] == platform_name
+        and str(target["chat_id"]) == str(chat_id)
+        and target.get("thread_id") == thread_id
+        for target in auto_targets
     )
     if not same_target:
         return None
@@ -416,6 +474,11 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         _feishu_available = False
 
     media_files = media_files or []
+
+    media_error = _validate_media_files(media_files)
+    if media_error:
+        return _error(media_error)
+
 
     if platform == Platform.SLACK and message:
         try:
@@ -590,6 +653,7 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         bot = Bot(token=token)
         int_chat_id = int(chat_id)
         media_files = media_files or []
+
         thread_kwargs = {}
         if thread_id is not None:
             thread_kwargs["message_thread_id"] = int(thread_id)
@@ -742,7 +806,6 @@ async def _send_discord(token, chat_id, message, thread_id=None, media_files=Non
         media_files = media_files or []
         last_data = None
         warnings = []
-
         # Thread endpoint: Discord threads are channels; send directly to the thread ID.
         if thread_id:
             url = f"https://discord.com/api/v10/channels/{thread_id}/messages"
@@ -999,11 +1062,11 @@ async def _send_email(extra, chat_id, message):
     import smtplib
     from email.mime.text import MIMEText
 
-    address = extra.get("address") or os.getenv("EMAIL_ADDRESS", "")
-    password = os.getenv("EMAIL_PASSWORD", "")
-    smtp_host = extra.get("smtp_host") or os.getenv("EMAIL_SMTP_HOST", "")
+    address = extra.get("address") or _runtime_env("EMAIL_ADDRESS", "")
+    password = _runtime_env("EMAIL_PASSWORD", "")
+    smtp_host = extra.get("smtp_host") or _runtime_env("EMAIL_SMTP_HOST", "")
     try:
-        smtp_port = int(os.getenv("EMAIL_SMTP_PORT", "587"))
+        smtp_port = int(_runtime_env("EMAIL_SMTP_PORT", "587"))
     except (ValueError, TypeError):
         smtp_port = 587
 
@@ -1039,8 +1102,8 @@ async def _send_sms(auth_token, chat_id, message):
 
     import base64
 
-    account_sid = os.getenv("TWILIO_ACCOUNT_SID", "")
-    from_number = os.getenv("TWILIO_PHONE_NUMBER", "")
+    account_sid = _runtime_env("TWILIO_ACCOUNT_SID", "")
+    from_number = _runtime_env("TWILIO_PHONE_NUMBER", "")
     if not account_sid or not auth_token or not from_number:
         return {"error": "SMS not configured (TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER required)"}
 
@@ -1089,8 +1152,8 @@ async def _send_mattermost(token, extra, chat_id, message):
     except ImportError:
         return {"error": "aiohttp not installed. Run: pip install aiohttp"}
     try:
-        base_url = (extra.get("url") or os.getenv("MATTERMOST_URL", "")).rstrip("/")
-        token = token or os.getenv("MATTERMOST_TOKEN", "")
+        base_url = (extra.get("url") or _runtime_env("MATTERMOST_URL", "")).rstrip("/")
+        token = token or _runtime_env("MATTERMOST_TOKEN", "")
         if not base_url or not token:
             return {"error": "Mattermost not configured (MATTERMOST_URL, MATTERMOST_TOKEN required)"}
         url = f"{base_url}/api/v4/posts"
@@ -1117,8 +1180,8 @@ async def _send_matrix(token, extra, chat_id, message):
     except ImportError:
         return {"error": "aiohttp not installed. Run: pip install aiohttp"}
     try:
-        homeserver = (extra.get("homeserver") or os.getenv("MATRIX_HOMESERVER", "")).rstrip("/")
-        token = token or os.getenv("MATRIX_ACCESS_TOKEN", "")
+        homeserver = (extra.get("homeserver") or _runtime_env("MATRIX_HOMESERVER", "")).rstrip("/")
+        token = token or _runtime_env("MATRIX_ACCESS_TOKEN", "")
         if not homeserver or not token:
             return {"error": "Matrix not configured (MATRIX_HOMESERVER, MATRIX_ACCESS_TOKEN required)"}
         txn_id = f"hermes_{int(time.time() * 1000)}_{os.urandom(4).hex()}"
@@ -1158,6 +1221,7 @@ async def _send_matrix_via_adapter(pconfig, chat_id, message, media_files=None, 
         return {"error": "Matrix dependencies not installed. Run: pip install 'mautrix[encryption]'"}
 
     media_files = media_files or []
+
 
     try:
         adapter = MatrixAdapter(pconfig)
@@ -1217,8 +1281,8 @@ async def _send_homeassistant(token, extra, chat_id, message):
     except ImportError:
         return {"error": "aiohttp not installed. Run: pip install aiohttp"}
     try:
-        hass_url = (extra.get("url") or os.getenv("HASS_URL", "")).rstrip("/")
-        token = token or os.getenv("HASS_TOKEN", "")
+        hass_url = (extra.get("url") or _runtime_env("HASS_URL", "")).rstrip("/")
+        token = token or _runtime_env("HASS_TOKEN", "")
         if not hass_url or not token:
             return {"error": "Home Assistant not configured (HASS_URL, HASS_TOKEN required)"}
         url = f"{hass_url}/api/services/notify/notify"
@@ -1247,7 +1311,7 @@ async def _send_dingtalk(extra, chat_id, message):
     except ImportError:
         return {"error": "httpx not installed"}
     try:
-        webhook_url = extra.get("webhook_url") or os.getenv("DINGTALK_WEBHOOK_URL", "")
+        webhook_url = extra.get("webhook_url") or _runtime_env("DINGTALK_WEBHOOK_URL", "")
         if not webhook_url:
             return {"error": "DingTalk not configured. Set DINGTALK_WEBHOOK_URL env var or webhook_url in dingtalk platform extra config."}
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -1300,6 +1364,7 @@ async def _send_weixin(pconfig, chat_id, message, media_files=None):
     except ImportError:
         return {"error": "Weixin adapter not available."}
 
+
     try:
         return await send_weixin_direct(
             extra=pconfig.extra,
@@ -1350,6 +1415,7 @@ async def _send_feishu(pconfig, chat_id, message, media_files=None, thread_id=No
         return {"error": "Feishu dependencies not installed. Run: pip install 'hermes-agent[feishu]'"}
 
     media_files = media_files or []
+
 
     try:
         adapter = FeishuAdapter(pconfig)
@@ -1422,9 +1488,9 @@ async def _send_qqbot(pconfig, chat_id, message):
         return _error("QQBot direct send requires httpx. Run: pip install httpx")
 
     extra = pconfig.extra or {}
-    appid = extra.get("app_id") or os.getenv("QQ_APP_ID", "")
+    appid = extra.get("app_id") or _runtime_env("QQ_APP_ID", "")
     secret = (pconfig.token or extra.get("client_secret")
-              or os.getenv("QQ_CLIENT_SECRET", ""))
+              or _runtime_env("QQ_CLIENT_SECRET", ""))
     if not appid or not secret:
         return _error("QQBot: QQ_APP_ID / QQ_CLIENT_SECRET not configured.")
 

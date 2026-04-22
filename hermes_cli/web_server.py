@@ -45,6 +45,9 @@ from hermes_cli.config import (
     check_config_version,
     redact_key,
 )
+from tools.plugin_guard import scan_plugin, should_allow_plugin_install
+from utils import env_var_enabled
+
 from gateway.status import get_running_pid, read_runtime_status
 
 try:
@@ -76,16 +79,18 @@ _reveal_timestamps: List[float] = []
 _REVEAL_MAX_PER_WINDOW = 5
 _REVEAL_WINDOW_SECONDS = 30
 
-# CORS: restrict to localhost origins only.  The web UI is intended to run
-# locally; binding to 0.0.0.0 with allow_origins=["*"] would let any website
-# read/modify config and secrets.
+# CORS: the dashboard is intended to run same-origin with this server. Cross-origin
+# localhost allowances let unrelated local web apps read the injected session token
+# and protected API responses, so we do not grant any cross-origin access by
+# default. Same-origin requests continue to work without CORS headers.
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
+    allow_origins=[],
     allow_methods=["*"],
     allow_headers=["*"],
-)
+    allow_credentials=False,
+ )
 
 # ---------------------------------------------------------------------------
 # Endpoints that do NOT require the session token.  Everything else under
@@ -99,7 +104,6 @@ _PUBLIC_API_PATHS: frozenset = frozenset({
     "/api/model/info",
     "/api/dashboard/themes",
     "/api/dashboard/plugins",
-    "/api/dashboard/plugins/rescan",
 })
 
 
@@ -118,7 +122,7 @@ def _require_token(request: Request) -> None:
 async def auth_middleware(request: Request, call_next):
     """Require the session token on all /api/ routes except the public list."""
     path = request.url.path
-    if path.startswith("/api/") and path not in _PUBLIC_API_PATHS and not path.startswith("/api/plugins/"):
+    if path.startswith("/api/") and path not in _PUBLIC_API_PATHS:
         auth = request.headers.get("authorization", "")
         expected = f"Bearer {_SESSION_TOKEN}"
         if not hmac.compare_digest(auth.encode(), expected.encode()):
@@ -752,16 +756,35 @@ async def get_env_vars():
 @app.put("/api/env")
 async def set_env_var(body: EnvVarUpdate):
     try:
+        from agent.model_ops import ModelOpsService
+        if ModelOpsService.is_protected_key(body.key):
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    f"{body.key} is a protected model-identity key. "
+                    "Use ModelOpsService or the dedicated model-switch endpoint."
+                ),
+            )
         save_env_value(body.key, body.value)
         return {"ok": True, "key": body.key}
+    except HTTPException:
+        raise
     except Exception as e:
         _log.exception("PUT /api/env failed")
         raise HTTPException(status_code=500, detail="Internal server error")
 
-
 @app.delete("/api/env")
 async def remove_env_var(body: EnvVarDelete):
     try:
+        from agent.model_ops import ModelOpsService
+        if ModelOpsService.is_protected_key(body.key):
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    f"{body.key} is a protected model-identity key. "
+                    "Use ModelOpsService or the dedicated model-switch endpoint."
+                ),
+            )
         removed = remove_env_value(body.key)
         if not removed:
             raise HTTPException(status_code=404, detail=f"{body.key} not found in .env")
@@ -772,7 +795,6 @@ async def remove_env_var(body: EnvVarDelete):
         _log.exception("DELETE /api/env failed")
         raise HTTPException(status_code=500, detail="Internal server error")
 
-
 @app.post("/api/env/reveal")
 async def reveal_env_var(body: EnvVarReveal, request: Request):
     """Return the real (unredacted) value of a single env var.
@@ -780,10 +802,22 @@ async def reveal_env_var(body: EnvVarReveal, request: Request):
     Protected by:
     - Ephemeral session token (generated per server start, injected into SPA)
     - Rate limiting (max 5 reveals per 30s window)
+    - Protected-key blocking (API keys, base URLs, model/provider identity)
     - Audit logging
     """
     # --- Token check ---
     _require_token(request)
+
+    # --- Protected-key guard ---
+    from agent.model_ops import ModelOpsService
+    if ModelOpsService.is_protected_key(body.key):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"{body.key} is a protected model-identity key. "
+                "Reveal is not permitted for security reasons."
+            ),
+        )
 
     # --- Rate limit ---
     now = time.time()
@@ -1447,13 +1481,18 @@ def _nous_poller(session_id: str) -> None:
         from hermes_cli.auth import persist_nous_credentials
         persist_nous_credentials(full_state)
         with _oauth_sessions_lock:
-            sess["status"] = "approved"
-        _log.info("oauth/device: nous login completed (session=%s)", session_id)
+            current = _oauth_sessions.get(session_id)
+            if current is not sess:
+                return
+            current["status"] = "approved"
     except Exception as e:
         _log.warning("nous device-code poll failed (session=%s): %s", session_id, e)
         with _oauth_sessions_lock:
-            sess["status"] = "error"
-            sess["error_message"] = str(e)
+            current = _oauth_sessions.get(session_id)
+            if current is not sess:
+                return
+            current["status"] = "error"
+            current["error_message"] = str(e)
 
 
 def _codex_full_login_worker(session_id: str) -> None:
@@ -1582,15 +1621,18 @@ def _codex_full_login_worker(session_id: str) -> None:
         )
         pool.add_entry(entry)
         with _oauth_sessions_lock:
-            sess["status"] = "approved"
-        _log.info("oauth/device: openai-codex login completed (session=%s)", session_id)
+            current = _oauth_sessions.get(session_id)
+            if current is not sess:
+                return
+            current["status"] = "approved"
     except Exception as e:
         _log.warning("codex device-code worker failed (session=%s): %s", session_id, e)
         with _oauth_sessions_lock:
-            s = _oauth_sessions.get(session_id)
-            if s:
-                s["status"] = "error"
-                s["error_message"] = str(e)
+            current = _oauth_sessions.get(session_id)
+            if current is None or current is not sess:
+                return
+            current["status"] = "error"
+            current["error_message"] = str(e)
 
 
 @app.post("/api/providers/oauth/{provider_id}/start")
@@ -1639,6 +1681,7 @@ async def submit_oauth_code(provider_id: str, body: OAuthSubmitBody, request: Re
 @app.get("/api/providers/oauth/{provider_id}/poll/{session_id}")
 async def poll_oauth_session(provider_id: str, session_id: str):
     """Poll a device-code session's status (no auth — read-only state)."""
+    _gc_oauth_sessions()
     with _oauth_sessions_lock:
         sess = _oauth_sessions.get(session_id)
     if not sess:
@@ -1657,6 +1700,7 @@ async def poll_oauth_session(provider_id: str, session_id: str):
 async def cancel_oauth_session(session_id: str, request: Request):
     """Cancel a pending OAuth session. Token-protected."""
     _require_token(request)
+    _gc_oauth_sessions()
     with _oauth_sessions_lock:
         sess = _oauth_sessions.pop(session_id, None)
     if sess is None:
@@ -2141,16 +2185,31 @@ def _discover_dashboard_plugins() -> list:
     ]
     if os.environ.get("HERMES_ENABLE_PROJECT_PLUGINS"):
         search_dirs.append((Path.cwd() / ".hermes" / "plugins", "project"))
-
     for plugins_root, source in search_dirs:
         if not plugins_root.is_dir():
             continue
         for child in sorted(plugins_root.iterdir()):
+            if source != "bundled" and not env_var_enabled("HERMES_ALLOW_EXTERNAL_DASHBOARD_PLUGINS"):
+                _log.warning(
+                    "Skipping external dashboard plugin %s — set HERMES_ALLOW_EXTERNAL_DASHBOARD_PLUGINS=1 to opt in",
+                    child,
+                )
+                continue
             if not child.is_dir():
                 continue
             manifest_file = child / "dashboard" / "manifest.json"
             if not manifest_file.exists():
                 continue
+            try:
+                scan_result = scan_plugin(child, source=source)
+                allowed, reason = should_allow_plugin_install(scan_result)
+            except Exception as exc:
+                _log.warning("Skipping dashboard plugin %s after scan failure: %s", child, exc)
+                continue
+            if not allowed:
+                _log.warning("Skipping dashboard plugin %s: %s", child, reason)
+                continue
+
             try:
                 data = json.loads(manifest_file.read_text(encoding="utf-8"))
                 name = data.get("name", child.name)
@@ -2255,7 +2314,11 @@ def _mount_plugin_api_routes():
         api_file_name = plugin.get("_api_file")
         if not api_file_name:
             continue
-        api_path = Path(plugin["_dir"]) / api_file_name
+        base_dir = Path(plugin["_dir"]).resolve()
+        api_path = (base_dir / api_file_name).resolve()
+        if not api_path.is_relative_to(base_dir):
+            _log.warning("Plugin %s declares api path outside the plugin directory: %s", plugin["name"], api_file_name)
+            continue
         if not api_path.exists():
             _log.warning("Plugin %s declares api=%s but file not found", plugin["name"], api_file_name)
             continue

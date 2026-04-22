@@ -4,6 +4,7 @@ import json
 import pytest
 from pathlib import Path
 
+from cron.jobs import create_job
 from tools.cronjob_tools import (
     _scan_cron_prompt,
     check_cronjob_requirements,
@@ -96,6 +97,301 @@ class TestCronjobRequirements:
         monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
 
         assert check_cronjob_requirements() is False
+
+
+class TestCronSessionMutationGuard:
+    @pytest.fixture(autouse=True)
+    def _setup_cron_dir(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("cron.jobs.CRON_DIR", tmp_path / "cron")
+        monkeypatch.setattr("cron.jobs.JOBS_FILE", tmp_path / "cron" / "jobs.json")
+        monkeypatch.setattr("cron.jobs.OUTPUT_DIR", tmp_path / "cron" / "output")
+
+    def test_create_update_remove_blocked_in_cron_session(self, monkeypatch):
+        from gateway.session_context import set_session_vars, clear_session_vars
+        tokens = set_session_vars(cron_session="1")
+        try:
+            created = json.loads(cronjob(action="create", prompt="Check", schedule="every 1h"))
+            assert created["success"] is False
+            assert "may not create" in created["error"]
+
+            # scoped list requires a current cron job id
+            listing = json.loads(cronjob(action="list"))
+            assert listing["success"] is False
+            assert "current job id" in listing["error"]
+        finally:
+            clear_session_vars(tokens)
+
+    def test_pause_scope_is_limited_in_cron_session(self, monkeypatch):
+        from gateway.session_context import set_session_vars, clear_session_vars
+        source = json.loads(cronjob(action="create", prompt="Source", schedule="every 1h"))
+        repair = json.loads(
+            cronjob(
+                action="create",
+                prompt="Repair",
+                trigger_job_id=source["job_id"],
+                trigger_after_failures=1,
+            )
+        )
+        other = json.loads(cronjob(action="create", prompt="Other", schedule="every 1h"))
+
+        tokens = set_session_vars(cron_session="1", cron_job_id=repair["job_id"])
+        try:
+            allowed = json.loads(cronjob(action="pause", job_id=source["job_id"]))
+            assert allowed["success"] is True
+
+            blocked = json.loads(cronjob(action="pause", job_id=other["job_id"]))
+            assert blocked["success"] is False
+            assert "may only pause" in blocked["error"]
+        finally:
+            clear_session_vars(tokens)
+
+    def test_pause_without_current_cron_job_id_fails_closed(self, monkeypatch):
+        from gateway.session_context import set_session_vars, clear_session_vars
+        source = json.loads(cronjob(action="create", prompt="Source", schedule="every 1h"))
+
+        tokens = set_session_vars(cron_session="1")
+        try:
+            blocked = json.loads(cronjob(action="pause", job_id=source["job_id"]))
+            assert blocked["success"] is False
+            assert "current cron job id is known" in blocked["error"]
+        finally:
+            clear_session_vars(tokens)
+
+class TestCronSessionListingAndOrigins:
+    @pytest.fixture(autouse=True)
+    def _setup_cron_dir(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("cron.jobs.CRON_DIR", tmp_path / "cron")
+        monkeypatch.setattr("cron.jobs.JOBS_FILE", tmp_path / "cron" / "jobs.json")
+        monkeypatch.setattr("cron.jobs.OUTPUT_DIR", tmp_path / "cron" / "output")
+
+    def test_scoped_cron_list_redacts_unneeded_metadata(self):
+        from gateway.session_context import set_session_vars, clear_session_vars
+        source = json.loads(cronjob(action="create", prompt="Sensitive prompt", schedule="every 1h", name="Source"))
+        repair = json.loads(
+            cronjob(
+                action="create",
+                prompt="Repair",
+                trigger_job_id=source["job_id"],
+                trigger_after_failures=1,
+            )
+        )
+
+        tokens = set_session_vars(cron_session="1", cron_job_id=repair["job_id"])
+        try:
+            listing = json.loads(cronjob(action="list"))
+            assert listing["success"] is True
+            assert {job["job_id"] for job in listing["jobs"]} == {source["job_id"], repair["job_id"]}
+            for job_view in listing["jobs"]:
+                assert "prompt_preview" not in job_view
+                assert "model" not in job_view
+                assert "provider" not in job_view
+                assert "base_url" not in job_view
+                assert "script" not in job_view
+                assert "deliver" not in job_view
+        finally:
+            clear_session_vars(tokens)
+
+    def test_reactive_trigger_requires_same_origin_context(self):
+        from gateway.session_context import set_session_vars, clear_session_vars
+        source = create_job(
+            prompt="Source",
+            schedule="every 1h",
+            origin={"platform": "telegram", "chat_id": "chat-a", "thread_id": None},
+        )
+
+        tokens = set_session_vars(platform="telegram", chat_id="chat-b", chat_name="")
+        try:
+            result = json.loads(
+                cronjob(
+                    action="create",
+                    prompt="Repair",
+                    trigger_job_id=source["id"],
+                    trigger_after_failures=1,
+                )
+            )
+            assert result["success"] is False
+            assert "same origin conversation" in result["error"]
+        finally:
+            clear_session_vars(tokens)
+
+class TestInteractiveCronOriginScoping:
+    @pytest.fixture(autouse=True)
+    def _setup_cron_dir(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("cron.jobs.CRON_DIR", tmp_path / "cron")
+        monkeypatch.setattr("cron.jobs.JOBS_FILE", tmp_path / "cron" / "jobs.json")
+        monkeypatch.setattr("cron.jobs.OUTPUT_DIR", tmp_path / "cron" / "output")
+
+    def test_interactive_list_only_shows_same_origin_jobs(self):
+        from gateway.session_context import set_session_vars, clear_session_vars
+        source_a = create_job(
+            prompt="secret A",
+            schedule="every 1h",
+            origin={"platform": "telegram", "chat_id": "chat-a", "thread_id": None},
+        )
+        create_job(
+            prompt="secret B",
+            schedule="every 1h",
+            origin={"platform": "telegram", "chat_id": "chat-b", "thread_id": None},
+        )
+        tokens = set_session_vars(platform="telegram", chat_id="chat-a", chat_name="")
+        try:
+            listing = json.loads(cronjob(action="list"))
+            assert listing["success"] is True
+            visible_ids = {job["job_id"] for job in listing["jobs"]}
+            assert visible_ids == {source_a["id"]}
+        finally:
+            clear_session_vars(tokens)
+
+
+class TestCronHealthScopeAndRedaction:
+    @pytest.fixture(autouse=True)
+    def _setup_cron_dir(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("cron.jobs.CRON_DIR", tmp_path / "cron")
+        monkeypatch.setattr("cron.jobs.JOBS_FILE", tmp_path / "cron" / "jobs.json")
+        monkeypatch.setattr("cron.jobs.OUTPUT_DIR", tmp_path / "cron" / "output")
+
+    def test_health_job_lists_same_origin_jobs_only(self):
+        from gateway.session_context import set_session_vars, clear_session_vars
+        source_same_origin = create_job(
+            prompt="Source",
+            schedule="every 1h",
+            origin={"platform": "telegram", "chat_id": "chat-a", "thread_id": None},
+        )
+        create_job(
+            prompt="Other origin",
+            schedule="every 1h",
+            origin={"platform": "telegram", "chat_id": "chat-b", "thread_id": None},
+        )
+        health_job = create_job(
+            prompt="Health",
+            schedule="every 1h",
+            origin={"platform": "telegram", "chat_id": "chat-a", "thread_id": None},
+            skills=["hermes-cron-health"],
+        )
+
+        tokens = set_session_vars(cron_session="1", cron_job_id=health_job["id"])
+        try:
+            listing = json.loads(cronjob(action="list"))
+            assert listing["success"] is True
+            visible_ids = {job["job_id"] for job in listing["jobs"]}
+            assert visible_ids == {source_same_origin["id"], health_job["id"]}
+        finally:
+            clear_session_vars(tokens)
+    def test_health_job_respects_origin_user_id(self):
+        from gateway.session_context import set_session_vars, clear_session_vars
+        same_user = create_job(
+            prompt="Source",
+            schedule="every 1h",
+            origin={"platform": "telegram", "chat_id": "chat-a", "thread_id": None, "user_id": "u-1"},
+        )
+        create_job(
+            prompt="Other user",
+            schedule="every 1h",
+            origin={"platform": "telegram", "chat_id": "chat-a", "thread_id": None, "user_id": "u-2"},
+        )
+        health_job = create_job(
+            prompt="Health",
+            schedule="every 1h",
+            origin={"platform": "telegram", "chat_id": "chat-a", "thread_id": None, "user_id": "u-1"},
+            skills=["hermes-cron-health"],
+        )
+
+        tokens = set_session_vars(cron_session="1", cron_job_id=health_job["id"], user_id="u-1")
+        try:
+            listing = json.loads(cronjob(action="list"))
+            assert listing["success"] is True
+            visible_ids = {job["job_id"] for job in listing["jobs"]}
+            assert visible_ids == {same_user["id"], health_job["id"]}
+        finally:
+            clear_session_vars(tokens)
+
+
+class TestDeliverValidation:
+    @pytest.fixture(autouse=True)
+    def _setup_cron_dir(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("cron.jobs.CRON_DIR", tmp_path / "cron")
+        monkeypatch.setattr("cron.jobs.JOBS_FILE", tmp_path / "cron" / "jobs.json")
+        monkeypatch.setattr("cron.jobs.OUTPUT_DIR", tmp_path / "cron" / "output")
+
+    def test_create_rejects_unknown_delivery_platform(self):
+        result = json.loads(cronjob(action="create", prompt="Check", schedule="every 1h", deliver="telegarm:-1001"))
+        assert result["success"] is False
+        assert "Unknown delivery platform" in result["error"]
+
+    def test_create_rejects_missing_explicit_target(self):
+        result = json.loads(cronjob(action="create", prompt="Check", schedule="every 1h", deliver="telegram:"))
+        assert result["success"] is False
+        assert "missing a target identifier" in result["error"]
+
+    def test_create_rejects_malformed_explicit_target(self):
+        result = json.loads(cronjob(action="create", prompt="Check", schedule="every 1h", deliver="discord::17585"))
+        assert result["success"] is False
+        assert "malformed" in result["error"]
+
+    def test_create_rejects_traversal_like_target(self):
+        result = json.loads(cronjob(action="create", prompt="Check", schedule="every 1h", deliver="qqbot:../../secrets"))
+        assert result["success"] is False
+        assert "blocked path-like target" in result["error"]
+
+    def test_create_rejects_malformed_matrix_explicit_target(self):
+        result = json.loads(cronjob(action="create", prompt="Check", schedule="every 1h", deliver="matrix:!room"))
+        assert result["success"] is False
+        assert "malformed" in result["error"]
+
+    def test_create_rejects_numeric_target_with_bad_thread(self):
+        result = json.loads(cronjob(action="create", prompt="Check", schedule="every 1h", deliver="telegram:-100123:bad"))
+        assert result["success"] is False
+        assert "malformed" in result["error"]
+
+    def test_create_accepts_matrix_alias_target(self):
+        result = json.loads(cronjob(action="create", prompt="Check", schedule="every 1h", deliver="matrix:#ops:example.org"))
+        assert result["success"] is True
+
+
+    def test_create_rejects_numeric_matrix_target(self):
+        result = json.loads(cronjob(action="create", prompt="Check", schedule="every 1h", deliver="matrix:123"))
+        assert result["success"] is False
+        assert "malformed" in result["error"]
+
+
+    def test_create_rejects_origin_delivery_without_origin_context(self):
+        result = json.loads(cronjob(action="create", prompt="Check", schedule="every 1h", deliver="origin"))
+        assert result["success"] is False
+        assert "requires a current origin conversation" in result["error"]
+
+    def test_create_rejects_webhook_delivery_target(self):
+        result = json.loads(cronjob(action="create", prompt="Check", schedule="every 1h", deliver="webhook:test-target"))
+        assert result["success"] is False
+        assert "Unknown delivery platform" in result["error"]
+
+
+
+
+
+    def test_pause_response_is_redacted_in_cron_session(self):
+        from gateway.session_context import set_session_vars, clear_session_vars
+        source = create_job(
+            prompt="Sensitive prompt",
+            schedule="every 1h",
+            origin={"platform": "telegram", "chat_id": "chat-a", "thread_id": None},
+            base_url="http://localhost:4000/v1",
+        )
+        repair = create_job(
+            prompt="Repair",
+            reactive_trigger={
+                "job_id": source["id"],
+                "after_consecutive_failures": 1,
+            },
+        )
+        tokens = set_session_vars(cron_session="1", cron_job_id=repair["id"])
+        try:
+            paused = json.loads(cronjob(action="pause", job_id=source["id"]))
+            assert paused["success"] is True
+            assert "prompt_preview" not in paused["job"]
+            assert "base_url" not in paused["job"]
+            assert "deliver" not in paused["job"]
+        finally:
+            clear_session_vars(tokens)
 
 
 class TestUnifiedCronjobTool:
@@ -231,3 +527,70 @@ class TestUnifiedCronjobTool:
         assert updated["success"] is True
         assert updated["job"]["skills"] == []
         assert updated["job"]["skill"] is None
+    def test_create_reactive_job(self):
+        source = json.loads(
+            cronjob(action="create", prompt="Source", schedule="every 1h", name="Source job")
+        )
+        repair = json.loads(
+            cronjob(
+                action="create",
+                prompt="Repair source",
+                trigger_job_id=source["job_id"],
+                trigger_after_failures=2,
+                name="Repair job",
+            )
+        )
+
+        assert repair["success"] is True
+        assert repair["job"]["schedule"] == "reactive"
+        assert repair["job"]["reactive_trigger"]["job_id"] == source["job_id"]
+        assert repair["job"]["reactive_trigger"]["after_consecutive_failures"] == 2
+
+    def test_create_rejects_mixed_schedule_and_reactive_mode(self):
+        source = json.loads(cronjob(action="create", prompt="Source", schedule="every 1h"))
+        mixed = json.loads(
+            cronjob(
+                action="create",
+                prompt="Repair",
+                schedule="every 1h",
+                trigger_job_id=source["job_id"],
+                trigger_after_failures=1,
+            )
+        )
+        assert mixed["success"] is False
+        assert "both scheduled and reactive" in mixed["error"]
+
+    def test_reactive_job_requires_complete_trigger_config(self):
+        source = json.loads(
+            cronjob(action="create", prompt="Source", schedule="every 1h", name="Source job")
+        )
+        missing_threshold = json.loads(
+            cronjob(action="create", prompt="Repair", trigger_job_id=source["job_id"])
+        )
+        assert missing_threshold["success"] is False
+        assert "Reactive triggers require both" in missing_threshold["error"]
+
+        missing_source = json.loads(
+            cronjob(action="create", prompt="Repair", trigger_after_failures=2)
+        )
+        assert missing_source["success"] is False
+        assert "Reactive triggers require both" in missing_source["error"]
+
+    def test_update_clear_schedule_requires_trigger(self):
+        created = json.loads(cronjob(action="create", prompt="Check", schedule="every 1h"))
+        updated = json.loads(cronjob(action="update", job_id=created["job_id"], schedule=""))
+        assert updated["success"] is False
+        assert "either a schedule or a reactive trigger" in updated["error"]
+
+    def test_list_exposes_health_metrics(self):
+        created = json.loads(
+            cronjob(action="create", prompt="Check", schedule="every 1h", name="Health job")
+        )
+        from cron.jobs import mark_job_run
+        mark_job_run(created["job_id"], success=False, error="boom")
+
+        listing = json.loads(cronjob(action="list"))
+        health = listing["jobs"][0]["health"]
+        assert health["total_runs"] == 1
+        assert health["total_failures"] == 1
+        assert health["consecutive_failures"] == 1

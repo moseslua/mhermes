@@ -679,13 +679,22 @@ run_conversation():
 ### Testing
 
 ```bash
-python -m pytest tests/ -o 'addopts=' -q   # Full suite
-python -m pytest tests/tools/ -q            # Specific area
+scripts/run_tests.sh                     # Default Python suite (excludes integration/e2e)
+scripts/run_tests.sh tests/tools/        # Specific area
 ```
 
 - Tests auto-redirect `HERMES_HOME` to temp dirs — never touch real `~/.hermes/`
-- Run full suite before pushing any change
-- Use `-o 'addopts='` to clear any baked-in pytest flags
+- Run the default suite before pushing any change, then add integration/e2e coverage separately when your change touches those paths
+- If you intentionally run a narrower command, record the exact command in your verification notes
+Use these direct pytest commands only for the suites the wrapper intentionally excludes:
+
+```bash
+source venv/bin/activate
+python -m pytest -o "addopts=" tests/integration/ -q -n 4
+python -m pytest -o "addopts=" tests/e2e/ -q -n 4
+```
+
+
 
 ### Commit Conventions
 

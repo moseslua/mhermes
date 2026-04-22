@@ -17,7 +17,8 @@ Lifecycle hooks
 ---------------
 Plugins may register callbacks for any of the hooks in ``VALID_HOOKS``.
 The agent core calls ``invoke_hook(name, **kwargs)`` at the appropriate
-points.
+points. Sensitive tool/LLM hooks receive sanitized metadata-only payloads, not
+raw prompts, responses, or full tool arguments.
 
 Tool registration
 -----------------
@@ -115,6 +116,55 @@ class LoadedPlugin:
     commands_registered: List[str] = field(default_factory=list)
     enabled: bool = False
     error: Optional[str] = None
+
+
+def _summarize_hook_args(args: Any) -> Dict[str, Any]:
+    if not isinstance(args, dict):
+        return {"argument_count": 0, "argument_keys": []}
+    return {
+        "argument_count": len(args),
+        "argument_keys": sorted(str(key) for key in args.keys()),
+    }
+
+
+def _sanitize_hook_kwargs(hook_name: str, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    if hook_name == "pre_tool_call":
+        return dict(kwargs)
+    if hook_name == "post_tool_call":
+        result_text = str(kwargs.get("result") or "")
+        return {
+            "tool_name": kwargs.get("tool_name"),
+            "args": _summarize_hook_args(kwargs.get("args")),
+            "result_length": len(result_text),
+            "task_id": kwargs.get("task_id", ""),
+            "session_id": kwargs.get("session_id", ""),
+            "tool_call_id": kwargs.get("tool_call_id", ""),
+        }
+    if hook_name == "pre_llm_call":
+        user_message = str(kwargs.get("user_message") or "")
+        history = kwargs.get("conversation_history") or []
+        return {
+            "session_id": kwargs.get("session_id", ""),
+            "is_first_turn": bool(kwargs.get("is_first_turn")),
+            "model": kwargs.get("model", ""),
+            "platform": kwargs.get("platform", ""),
+            "sender_id_present": bool(kwargs.get("sender_id")),
+            "user_message_chars": len(user_message),
+            "conversation_history_length": len(history) if isinstance(history, list) else 0,
+        }
+    if hook_name == "post_llm_call":
+        user_message = str(kwargs.get("user_message") or "")
+        assistant_response = str(kwargs.get("assistant_response") or "")
+        history = kwargs.get("conversation_history") or []
+        return {
+            "session_id": kwargs.get("session_id", ""),
+            "model": kwargs.get("model", ""),
+            "platform": kwargs.get("platform", ""),
+            "user_message_chars": len(user_message),
+            "assistant_response_chars": len(assistant_response),
+            "conversation_history_length": len(history) if isinstance(history, list) else 0,
+        }
+    return dict(kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -530,6 +580,18 @@ class PluginManager:
         loaded = LoadedPlugin(manifest=manifest)
 
         try:
+            if manifest.source in ("user", "project") and manifest.path:
+                from tools.plugin_guard import scan_plugin, should_allow_plugin_install
+                scan_result = scan_plugin(Path(manifest.path), source=manifest.source)
+                allowed, reason = should_allow_plugin_install(scan_result)
+                if not allowed:
+                    raise RuntimeError(f"Plugin blocked by security guard: {reason}")
+            elif manifest.source == "entrypoint" and not _env_enabled("HERMES_ALLOW_ENTRYPOINT_PLUGINS"):
+                raise RuntimeError(
+                    "Entry-point plugins are disabled by default until plugin_guard "
+                    "supports package scanning. Set HERMES_ALLOW_ENTRYPOINT_PLUGINS=1 "
+                    "to opt in after review."
+                )
             if manifest.source in ("user", "project"):
                 module = self._load_directory_module(manifest)
             else:
@@ -637,23 +699,23 @@ class PluginManager:
 
         Returns a list of non-``None`` return values from callbacks.
 
-        For ``pre_llm_call``, callbacks may return a dict describing
-        context to inject into the current turn's user message::
+        Sensitive hook payloads are sanitized before delivery, except
+        ``pre_tool_call`` which keeps raw arguments so approval/policy plugins
+        can make content-based allow/deny decisions.
 
-            {"context": "recalled text..."}
-            "recalled text..."          # plain string, equivalent
+        - ``post_tool_call`` receives tool name plus argument/result metadata
+        - ``pre_llm_call`` / ``post_llm_call`` receive message/response lengths and session metadata
+        - request/session hooks keep their existing metadata-only payloads
 
-        Context is ALWAYS injected into the user message, never the
-        system prompt.  This preserves the prompt cache prefix — the
-        system prompt stays identical across turns so cached tokens
-        are reused.  All injected context is ephemeral — never
-        persisted to session DB.
+        Any context a plugin injects via ``pre_llm_call`` remains ephemeral and is
+        appended to the current user message, never the persisted system prompt.
         """
         callbacks = self._hooks.get(hook_name, [])
         results: List[Any] = []
+        hook_kwargs = _sanitize_hook_kwargs(hook_name, kwargs)
         for cb in callbacks:
             try:
-                ret = cb(**kwargs)
+                ret = cb(**hook_kwargs)
                 if ret is not None:
                     results.append(ret)
             except Exception as exc:

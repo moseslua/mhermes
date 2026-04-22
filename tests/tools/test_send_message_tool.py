@@ -9,15 +9,22 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from gateway.config import Platform
+from gateway.session_context import (
+    register_session_attachment_path,
+    restore_session_vars,
+    set_session_vars,
+ )
 from tools.send_message_tool import (
     _derive_forum_thread_name,
     _parse_target_ref,
     _send_discord,
+    _send_email,
     _send_matrix_via_adapter,
     _send_telegram,
     _send_to_platform,
+    _validate_media_path,
     send_message_tool,
-)
+ )
 
 
 def _run_async_immediately(coro):
@@ -99,6 +106,40 @@ class TestSendMessageTool:
         assert "final response" in result["note"]
         send_mock.assert_not_awaited()
         mirror_mock.assert_not_called()
+
+    def test_cron_duplicate_skip_checks_all_auto_delivery_targets(self):
+        config, _telegram_cfg = _make_config()
+        config.platforms[Platform.DISCORD] = SimpleNamespace(enabled=True, token="***", extra={})
+        tokens = set_session_vars(cron_job_id="job-1")
+        try:
+            with patch("cron.jobs.get_job", return_value={"id": "job-1"}), \
+                 patch("cron.scheduler._resolve_delivery_targets", return_value=[
+                     {"platform": "telegram", "chat_id": "-1001", "thread_id": None},
+                     {"platform": "discord", "chat_id": "2002", "thread_id": None},
+                 ]), \
+                 patch("gateway.config.load_gateway_config", return_value=config), \
+                 patch("tools.interrupt.is_interrupted", return_value=False), \
+                 patch("model_tools._run_async", side_effect=_run_async_immediately), \
+                 patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+                 patch("gateway.mirror.mirror_to_session", return_value=True) as mirror_mock:
+                result = json.loads(
+                    send_message_tool(
+                        {
+                            "action": "send",
+                            "target": "discord:2002",
+                            "message": "hello",
+                        }
+                    )
+                )
+        finally:
+            restore_session_vars(tokens)
+
+        assert result["success"] is True
+        assert result["skipped"] is True
+        assert result["reason"] == "cron_auto_delivery_duplicate_target"
+        send_mock.assert_not_awaited()
+        mirror_mock.assert_not_called()
+
 
     def test_cron_different_target_still_sends(self):
         config, telegram_cfg = _make_config()
@@ -334,6 +375,51 @@ class TestSendMessageTool:
         assert "error" in result
         assert leaked not in result["error"]
         assert "access_token=***" in result["error"]
+
+
+class TestRuntimeEnvOverrides:
+    def test_registered_attachment_path_allowed_in_session(self, tmp_path):
+        attachment = tmp_path / "registered.txt"
+        attachment.write_text("ok")
+        tokens = set_session_vars(platform="telegram", chat_id="123")
+        try:
+            register_session_attachment_path(str(attachment))
+            assert _validate_media_path(str(attachment)) is None
+        finally:
+            restore_session_vars(tokens)
+
+
+    def test_send_email_uses_session_env_overrides(self):
+        tokens = set_session_vars(env_overrides={
+            "EMAIL_ADDRESS": "bot@example.com",
+            "EMAIL_PASSWORD": "secret",
+            "EMAIL_SMTP_HOST": "smtp.example.com",
+            "EMAIL_SMTP_PORT": "2525",
+        })
+        server = MagicMock()
+        try:
+            with patch("smtplib.SMTP", return_value=server):
+                result = asyncio.run(_send_email({}, "user@example.com", "hello"))
+        finally:
+            restore_session_vars(tokens)
+
+        assert result["success"] is True
+        server.login.assert_called_once_with("bot@example.com", "secret")
+        server.send_message.assert_called_once()
+
+    def test_send_to_platform_rejects_home_relative_media_path(self):
+        pconfig = SimpleNamespace(enabled=True, token="tok", extra={})
+        result = asyncio.run(
+            _send_to_platform(
+                Platform.TELEGRAM,
+                pconfig,
+                "123",
+                "hello",
+                media_files=[("~/.ssh/id_rsa", False)],
+            )
+        )
+
+        assert result["error"].startswith("Blocked media attachment path")
 
 
 class TestSendTelegramMediaDelivery:
@@ -583,15 +669,23 @@ class TestSendToPlatformChunking:
             return {"success": True, "platform": "telegram", "chat_id": chat_id, "message_id": str(len(sent_calls))}
 
         long_msg = "word " * 2000  # ~10000 chars, well over 4096
-        media = [("/tmp/photo.png", False)]
-        with patch("tools.send_message_tool._send_telegram", fake_send):
-            asyncio.run(
-                _send_to_platform(
-                    Platform.TELEGRAM,
-                    SimpleNamespace(enabled=True, token="tok", extra={}),
-                    "123", long_msg, media_files=media,
+        photo_path = Path("/tmp/photo.png")
+        photo_path.write_bytes(b"png")
+        media = [(str(photo_path), False)]
+        tokens = set_session_vars(platform="telegram", chat_id="123")
+        try:
+            register_session_attachment_path(str(photo_path))
+            with patch("tools.send_message_tool._send_telegram", fake_send):
+                asyncio.run(
+                    _send_to_platform(
+                        Platform.TELEGRAM,
+                        SimpleNamespace(enabled=True, token="tok", extra={}),
+                        "123", long_msg, media_files=media,
+                    )
                 )
-            )
+        finally:
+            restore_session_vars(tokens)
+            photo_path.unlink(missing_ok=True)
         assert len(sent_calls) >= 3
         assert all(call == [] for call in sent_calls[:-1])
         assert sent_calls[-1] == media
@@ -603,16 +697,21 @@ class TestSendToPlatformChunking:
 
         try:
             helper = AsyncMock(return_value={"success": True, "platform": "matrix", "chat_id": "!room:example.com", "message_id": "$evt"})
-            with patch("tools.send_message_tool._send_matrix_via_adapter", helper):
-                result = asyncio.run(
-                    _send_to_platform(
-                        Platform.MATRIX,
-                        SimpleNamespace(enabled=True, token="tok", extra={"homeserver": "https://matrix.example.com"}),
-                        "!room:example.com",
-                        "here you go",
-                        media_files=[(str(doc_path), False)],
+            tokens = set_session_vars(platform="telegram", chat_id="123")
+            try:
+                register_session_attachment_path(str(doc_path))
+                with patch("tools.send_message_tool._send_matrix_via_adapter", helper):
+                    result = asyncio.run(
+                        _send_to_platform(
+                            Platform.MATRIX,
+                            SimpleNamespace(enabled=True, token="tok", extra={"homeserver": "https://matrix.example.com"}),
+                            "!room:example.com",
+                            "here you go",
+                            media_files=[(str(doc_path), False)],
+                        )
                     )
-                )
+            finally:
+                restore_session_vars(tokens)
 
             assert result["success"] is True
             helper.assert_awaited_once()
@@ -889,18 +988,33 @@ class TestParseTargetRefMatrix:
         assert thread_id is None
         assert is_explicit is True
 
-    def test_matrix_user_mxid_is_explicit(self):
-        """Matrix user MXIDs (@) are recognized as explicit targets."""
+    def test_matrix_user_mxid_is_not_explicit(self):
+        """Matrix user MXIDs (@) require DM-room resolution and are not explicit send targets."""
         chat_id, thread_id, is_explicit = _parse_target_ref("matrix", "@hermes:matrix.org")
-        assert chat_id == "@hermes:matrix.org"
+        assert chat_id is None
+        assert thread_id is None
+        assert is_explicit is False
+
+    def test_matrix_alias_is_explicit(self):
+        """Matrix room aliases (#) are accepted as explicit targets."""
+        chat_id, thread_id, is_explicit = _parse_target_ref("matrix", "#general:matrix.org")
+        assert chat_id == "#general:matrix.org"
         assert thread_id is None
         assert is_explicit is True
 
-    def test_matrix_alias_is_not_explicit(self):
-        """Matrix room aliases (#) are NOT explicit — they need resolution."""
-        chat_id, thread_id, is_explicit = _parse_target_ref("matrix", "#general:matrix.org")
+    def test_matrix_prefix_without_homeserver_is_not_explicit(self):
+        chat_id, thread_id, is_explicit = _parse_target_ref("matrix", "!room")
         assert chat_id is None
+        assert thread_id is None
         assert is_explicit is False
+    def test_matrix_numeric_id_is_not_explicit(self):
+        chat_id, thread_id, is_explicit = _parse_target_ref("matrix", "123")
+        assert chat_id is None
+        assert thread_id is None
+        assert is_explicit is False
+
+
+
 
     def test_matrix_prefix_only_matches_matrix_platform(self):
         """! and @ prefixes are only treated as explicit for the matrix platform."""
@@ -1076,7 +1190,7 @@ class TestSendDiscordMedia:
         mock_session, _ = self._build_mock(200, {"id": "txt_ok"})
         with patch("aiohttp.ClientSession", return_value=mock_session):
             result = asyncio.run(
-                _send_discord("tok", "333", "hello", media_files=[("/nonexistent/file.png", False)])
+                _send_discord("tok", "333", "hello", media_files=[("/tmp/missing-file.png", False)])
             )
 
         assert result["success"] is True
@@ -1163,42 +1277,56 @@ class TestSendToPlatformDiscordMedia:
 
         # A message long enough to get chunked (Discord limit is 2000)
         long_msg = "A" * 1900 + " " + "B" * 1900
-
-        with patch("tools.send_message_tool._send_discord", side_effect=mock_send_discord):
-            result = asyncio.run(
-                _send_to_platform(
-                    Platform.DISCORD,
-                    SimpleNamespace(enabled=True, token="tok", extra={}),
-                    "999",
-                    long_msg,
-                    media_files=[("/fake/img.png", False)],
+        image_path = Path("/tmp/fake-img.png")
+        image_path.write_bytes(b"png")
+        tokens = set_session_vars(platform="telegram", chat_id="123")
+        try:
+            register_session_attachment_path(str(image_path))
+            with patch("tools.send_message_tool._send_discord", side_effect=mock_send_discord):
+                result = asyncio.run(
+                    _send_to_platform(
+                        Platform.DISCORD,
+                        SimpleNamespace(enabled=True, token="tok", extra={}),
+                        "999",
+                        long_msg,
+                        media_files=[(str(image_path), False)],
+                    )
                 )
-            )
+        finally:
+            restore_session_vars(tokens)
+            image_path.unlink(missing_ok=True)
 
         assert result["success"] is True
         assert len(call_log) == 2  # Message was chunked
         assert call_log[0]["media_files"] == []  # First chunk: no media
-        assert call_log[1]["media_files"] == [("/fake/img.png", False)]  # Last chunk: media attached
+        assert call_log[1]["media_files"] == [(str(image_path), False)]  # Last chunk: media attached
 
     def test_single_chunk_gets_media(self):
         """Short message (single chunk) gets media_files directly."""
         send_mock = AsyncMock(return_value={"success": True, "message_id": "1"})
-
-        with patch("tools.send_message_tool._send_discord", send_mock):
-            result = asyncio.run(
-                _send_to_platform(
-                    Platform.DISCORD,
-                    SimpleNamespace(enabled=True, token="tok", extra={}),
-                    "888",
-                    "short message",
-                    media_files=[("/fake/img.png", False)],
+        image_path = Path("/tmp/fake-img.png")
+        image_path.write_bytes(b"png")
+        tokens = set_session_vars(platform="telegram", chat_id="123")
+        try:
+            register_session_attachment_path(str(image_path))
+            with patch("tools.send_message_tool._send_discord", send_mock):
+                result = asyncio.run(
+                    _send_to_platform(
+                        Platform.DISCORD,
+                        SimpleNamespace(enabled=True, token="tok", extra={}),
+                        "888",
+                        "short message",
+                        media_files=[(str(image_path), False)],
+                    )
                 )
-            )
+        finally:
+            restore_session_vars(tokens)
+            image_path.unlink(missing_ok=True)
 
         assert result["success"] is True
         send_mock.assert_awaited_once()
         call_kwargs = send_mock.await_args.kwargs
-        assert call_kwargs["media_files"] == [("/fake/img.png", False)]
+        assert call_kwargs["media_files"] == [(str(image_path), False)]
 
 
 class TestSendMatrixUrlEncoding:
@@ -1561,7 +1689,7 @@ class TestSendDiscordForumMedia:
             result = asyncio.run(
                 _send_discord(
                     "tok", "forum_ch", "hi",
-                    media_files=[("/nonexistent/does-not-exist.png", False)],
+                    media_files=[("/tmp/does-not-exist.png", False)],
                 )
             )
 

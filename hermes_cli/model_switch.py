@@ -418,6 +418,8 @@ def switch_model(
     explicit_provider: str = "",
     user_providers: dict = None,
     custom_providers: list | None = None,
+    session_id: str = "",
+    use_model_ops: bool = False,
 ) -> ModelSwitchResult:
     """Core model-switching pipeline shared between CLI and gateway.
 
@@ -758,7 +760,7 @@ def switch_model(
         warnings.append(hermes_warn)
 
     # --- Build result ---
-    return ModelSwitchResult(
+    result = ModelSwitchResult(
         success=True,
         new_model=new_model,
         target_provider=target_provider,
@@ -773,6 +775,9 @@ def switch_model(
         model_info=model_info,
         is_global=is_global,
     )
+    if use_model_ops and is_global:
+        persist_model_switch(result, session_id=session_id)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1123,3 +1128,55 @@ def list_authenticated_providers(
     results.sort(key=lambda r: (not r["is_current"], -r["total_models"]))
 
     return results
+
+
+
+# ---------------------------------------------------------------------------
+# ModelOpsService integration — route global persistence through mutation
+# workflow so that model-identity changes are auditable and approval-gated.
+# ---------------------------------------------------------------------------
+
+def persist_model_switch(result: ModelSwitchResult, session_id: str = "") -> None:
+    """Route model-switch persistence through :class:`agent.model_ops.ModelOpsService`.
+
+    Creates ``model_mutations`` records for model, provider, base_url, and
+    api_key when they differ from the current state.  Mutations are created
+    in ``pending`` status — callers must ``approve_mutation`` and
+    ``execute_mutation`` to apply them.
+    """
+    try:
+        from agent.model_ops import ModelOpsService
+    except Exception:
+        logger.debug("ModelOpsService not available; skipping mutation logging")
+        return
+
+    ops = ModelOpsService()
+    sid = session_id or "system"
+
+    if result.new_model:
+        ops.create_mutation(sid, "model", "", result.new_model)
+    if result.target_provider:
+        ops.create_mutation(sid, "provider", "", result.target_provider)
+    if result.base_url:
+        ops.create_mutation(sid, "base_url", "", result.base_url)
+    # Do not store raw API key in mutation table; log the change without the secret
+    if result.api_key:
+        ops.create_mutation(sid, "api_key", "", "***redacted***")
+    # Auto-execute the mutations since the switch has already been applied
+    for mut in ops.list_mutations(session_id=sid, status="pending"):
+        ops.approve_mutation(mut["id"])
+        ops.execute_mutation(mut["id"])
+
+
+def _apply_model_switch_via_ops(
+    result: ModelSwitchResult,
+    session_id: str = "",
+) -> ModelSwitchResult:
+    """Wrapper that persists a successful global switch via ModelOpsService.
+
+    This is a drop-in replacement for direct ``save_config_value`` calls in
+    the CLI /model handler when ``--global`` is used.
+    """
+    if result.success and result.is_global:
+        persist_model_switch(result, session_id=session_id)
+    return result

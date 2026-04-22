@@ -11,7 +11,7 @@
 #   * Proper venv activation
 #
 # Usage:
-#   scripts/run_tests.sh                     # full suite
+#   scripts/run_tests.sh                     # default Python suite (excludes integration/e2e)
 #   scripts/run_tests.sh tests/agent/        # one directory
 #   scripts/run_tests.sh tests/agent/test_foo.py::TestClass::test_method
 #   scripts/run_tests.sh --tb=long -v        # pass-through pytest args
@@ -70,7 +70,7 @@ unset HERMES_YOLO_MODE HERMES_INTERACTIVE HERMES_QUIET HERMES_TOOL_PROGRESS \
       HERMES_PLATFORM HERMES_INFERENCE_PROVIDER HERMES_MANAGED HERMES_DEV \
       HERMES_CONTAINER HERMES_EPHEMERAL_SYSTEM_PROMPT HERMES_TIMEZONE \
       HERMES_REDACT_SECRETS HERMES_BACKGROUND_NOTIFICATIONS HERMES_EXEC_ASK \
-      HERMES_HOME_MODE 2>/dev/null || true
+      HERMES_HOME_MODE HERMES_CRON_SESSION 2>/dev/null || true
 
 # Pin deterministic runtime.
 export TZ=UTC

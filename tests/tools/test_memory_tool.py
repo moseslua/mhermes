@@ -113,6 +113,13 @@ class TestMemoryStoreAdd:
         result = store.add("memory", "  ")
         assert result["success"] is False
 
+    def test_add_duplicate_reports_not_mutated(self, store):
+        store.add("memory", "fact A")
+        result = store.add("memory", "fact A")
+        assert result["success"] is True
+        assert result["mutated"] is False
+
+
     def test_add_duplicate_rejected(self, store):
         store.add("memory", "fact A")
         result = store.add("memory", "fact A")

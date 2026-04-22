@@ -73,8 +73,14 @@ class FakeMemoryProvider(MemoryProvider):
     def on_pre_compress(self, messages):
         self.pre_compress_called = True
 
-    def on_memory_write(self, action, target, content):
-        self.memory_writes.append((action, target, content))
+    def on_memory_write(self, action, target, content, **kwargs):
+        self.memory_writes.append({
+            "action": action,
+            "target": target,
+            "content": content,
+            "old_text": kwargs.get("old_text"),
+            "current_state": kwargs.get("current_state"),
+        })
 
 
 # ---------------------------------------------------------------------------
@@ -859,8 +865,8 @@ class TestOnMemoryWriteBridge:
         p = FakeMemoryProvider("ext")
         mgr.add_provider(p)
 
-        mgr.on_memory_write("add", "memory", "new fact")
-        assert p.memory_writes == [("add", "memory", "new fact")]
+        mgr.on_memory_write("add", "memory", "new fact", current_state=["new fact"])
+        assert p.memory_writes == [{"action": "add", "target": "memory", "content": "new fact", "old_text": None, "current_state": ["new fact"]}]
 
     def test_on_memory_write_replace(self):
         """on_memory_write fires for 'replace' actions."""
@@ -868,21 +874,17 @@ class TestOnMemoryWriteBridge:
         p = FakeMemoryProvider("ext")
         mgr.add_provider(p)
 
-        mgr.on_memory_write("replace", "user", "updated pref")
-        assert p.memory_writes == [("replace", "user", "updated pref")]
+        mgr.on_memory_write("replace", "user", "updated pref", old_text="old pref", current_state=["updated pref"])
+        assert p.memory_writes == [{"action": "replace", "target": "user", "content": "updated pref", "old_text": "old pref", "current_state": ["updated pref"]}]
 
     def test_on_memory_write_remove_not_bridged(self):
-        """The bridge intentionally skips 'remove' — only add/replace notify."""
-        # This tests the contract that run_agent.py checks:
-        #   function_args.get("action") in ("add", "replace")
+        """Remove actions carry canonical state too."""
         mgr = MemoryManager()
         p = FakeMemoryProvider("ext")
         mgr.add_provider(p)
 
-        # Manager itself doesn't filter — run_agent.py does.
-        # But providers should handle remove gracefully.
-        mgr.on_memory_write("remove", "memory", "old fact")
-        assert p.memory_writes == [("remove", "memory", "old fact")]
+        mgr.on_memory_write("remove", "memory", "", old_text="old fact", current_state=[])
+        assert p.memory_writes == [{"action": "remove", "target": "memory", "content": "", "old_text": "old fact", "current_state": []}]
 
     def test_memory_manager_tool_injection_deduplicates(self):
         """Memory manager tools already in self.tools (from plugin registry)
@@ -936,9 +938,9 @@ class TestOnMemoryWriteBridge:
         mgr.add_provider(bad)
         mgr.add_provider(good)
 
-        mgr.on_memory_write("add", "user", "test")
+        mgr.on_memory_write("add", "user", "test", current_state=["test"])
         # Good provider still received the call despite bad provider crashing
-        assert good.memory_writes == [("add", "user", "test")]
+        assert good.memory_writes == [{"action": "add", "target": "user", "content": "test", "old_text": None, "current_state": ["test"]}]
 
 
 class TestHonchoCadenceTracking:
@@ -1008,3 +1010,18 @@ class TestHonchoCadenceTracking:
         p.on_turn_start(2, "second message")
         should_skip = p._injection_frequency == "first-turn" and p._turn_count > 1
         assert should_skip, "Second turn (turn 2) SHOULD be skipped"
+
+
+    def test_on_memory_write_legacy_provider_signature_called_once(self):
+        mgr = MemoryManager()
+        calls = []
+
+        class LegacyProvider(FakeMemoryProvider):
+            def on_memory_write(self, action, target, content):
+                calls.append((action, target, content))
+
+        provider = LegacyProvider("legacy")
+        mgr.add_provider(provider)
+
+        mgr.on_memory_write("replace", "memory", "new", old_text="old", current_state=["new"])
+        assert calls == [("replace", "memory", "new")]

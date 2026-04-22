@@ -22,6 +22,16 @@ from utils import is_truthy_value
 logger = logging.getLogger(__name__)
 
 
+
+def _session_env(name: str, default: str = "") -> str:
+    """Read gateway env values with cron/session overrides when present."""
+    from gateway.session_context import get_session_env_overrides
+    overrides = get_session_env_overrides()
+    if name in overrides:
+        return str(overrides[name])
+    return os.getenv(name, default)
+
+
 def _coerce_bool(value: Any, default: bool = True) -> bool:
     """Coerce bool-ish config values, preserving a caller-provided default."""
     if value is None:
@@ -289,7 +299,7 @@ class GatewayConfig:
             elif platform == Platform.EMAIL and config.extra.get("address"):
                 connected.append(platform)
             # SMS uses api_key (Twilio auth token) — SID checked via env
-            elif platform == Platform.SMS and os.getenv("TWILIO_ACCOUNT_SID"):
+            elif platform == Platform.SMS and _session_env("TWILIO_ACCOUNT_SID"):
                 connected.append(platform)
             # API Server uses enabled flag only (no token needed)
             elif platform == Platform.API_SERVER:
@@ -316,9 +326,9 @@ class GatewayConfig:
                 connected.append(platform)
             # DingTalk uses client_id/client_secret from config.extra or env vars
             elif platform == Platform.DINGTALK and (
-                config.extra.get("client_id") or os.getenv("DINGTALK_CLIENT_ID")
+                config.extra.get("client_id") or _session_env("DINGTALK_CLIENT_ID")
             ) and (
-                config.extra.get("client_secret") or os.getenv("DINGTALK_CLIENT_SECRET")
+                config.extra.get("client_secret") or _session_env("DINGTALK_CLIENT_SECRET")
             ):
                 connected.append(platform)
         
@@ -599,12 +609,12 @@ def load_gateway_config() -> GatewayConfig:
             # Slack settings → env vars (env vars take precedence)
             slack_cfg = yaml_cfg.get("slack", {})
             if isinstance(slack_cfg, dict):
-                if "require_mention" in slack_cfg and not os.getenv("SLACK_REQUIRE_MENTION"):
+                if "require_mention" in slack_cfg and not _session_env("SLACK_REQUIRE_MENTION"):
                     os.environ["SLACK_REQUIRE_MENTION"] = str(slack_cfg["require_mention"]).lower()
-                if "allow_bots" in slack_cfg and not os.getenv("SLACK_ALLOW_BOTS"):
+                if "allow_bots" in slack_cfg and not _session_env("SLACK_ALLOW_BOTS"):
                     os.environ["SLACK_ALLOW_BOTS"] = str(slack_cfg["allow_bots"]).lower()
                 frc = slack_cfg.get("free_response_channels")
-                if frc is not None and not os.getenv("SLACK_FREE_RESPONSE_CHANNELS"):
+                if frc is not None and not _session_env("SLACK_FREE_RESPONSE_CHANNELS"):
                     if isinstance(frc, list):
                         frc = ",".join(str(v) for v in frc)
                     os.environ["SLACK_FREE_RESPONSE_CHANNELS"] = str(frc)
@@ -612,32 +622,32 @@ def load_gateway_config() -> GatewayConfig:
             # Discord settings → env vars (env vars take precedence)
             discord_cfg = yaml_cfg.get("discord", {})
             if isinstance(discord_cfg, dict):
-                if "require_mention" in discord_cfg and not os.getenv("DISCORD_REQUIRE_MENTION"):
+                if "require_mention" in discord_cfg and not _session_env("DISCORD_REQUIRE_MENTION"):
                     os.environ["DISCORD_REQUIRE_MENTION"] = str(discord_cfg["require_mention"]).lower()
                 frc = discord_cfg.get("free_response_channels")
-                if frc is not None and not os.getenv("DISCORD_FREE_RESPONSE_CHANNELS"):
+                if frc is not None and not _session_env("DISCORD_FREE_RESPONSE_CHANNELS"):
                     if isinstance(frc, list):
                         frc = ",".join(str(v) for v in frc)
                     os.environ["DISCORD_FREE_RESPONSE_CHANNELS"] = str(frc)
-                if "auto_thread" in discord_cfg and not os.getenv("DISCORD_AUTO_THREAD"):
+                if "auto_thread" in discord_cfg and not _session_env("DISCORD_AUTO_THREAD"):
                     os.environ["DISCORD_AUTO_THREAD"] = str(discord_cfg["auto_thread"]).lower()
-                if "reactions" in discord_cfg and not os.getenv("DISCORD_REACTIONS"):
+                if "reactions" in discord_cfg and not _session_env("DISCORD_REACTIONS"):
                     os.environ["DISCORD_REACTIONS"] = str(discord_cfg["reactions"]).lower()
                 # ignored_channels: channels where bot never responds (even when mentioned)
                 ic = discord_cfg.get("ignored_channels")
-                if ic is not None and not os.getenv("DISCORD_IGNORED_CHANNELS"):
+                if ic is not None and not _session_env("DISCORD_IGNORED_CHANNELS"):
                     if isinstance(ic, list):
                         ic = ",".join(str(v) for v in ic)
                     os.environ["DISCORD_IGNORED_CHANNELS"] = str(ic)
                 # allowed_channels: if set, bot ONLY responds in these channels (whitelist)
                 ac = discord_cfg.get("allowed_channels")
-                if ac is not None and not os.getenv("DISCORD_ALLOWED_CHANNELS"):
+                if ac is not None and not _session_env("DISCORD_ALLOWED_CHANNELS"):
                     if isinstance(ac, list):
                         ac = ",".join(str(v) for v in ac)
                     os.environ["DISCORD_ALLOWED_CHANNELS"] = str(ac)
                 # no_thread_channels: channels where bot responds directly without creating thread
                 ntc = discord_cfg.get("no_thread_channels")
-                if ntc is not None and not os.getenv("DISCORD_NO_THREAD_CHANNELS"):
+                if ntc is not None and not _session_env("DISCORD_NO_THREAD_CHANNELS"):
                     if isinstance(ntc, list):
                         ntc = ",".join(str(v) for v in ntc)
                     os.environ["DISCORD_NO_THREAD_CHANNELS"] = str(ntc)
@@ -653,30 +663,30 @@ def load_gateway_config() -> GatewayConfig:
                         ("users", "DISCORD_ALLOW_MENTION_USERS"),
                         ("replied_user", "DISCORD_ALLOW_MENTION_REPLIED_USER"),
                     ):
-                        if yaml_key in allow_mentions_cfg and not os.getenv(env_key):
+                        if yaml_key in allow_mentions_cfg and not _session_env(env_key):
                             os.environ[env_key] = str(allow_mentions_cfg[yaml_key]).lower()
 
             # Telegram settings → env vars (env vars take precedence)
             telegram_cfg = yaml_cfg.get("telegram", {})
             if isinstance(telegram_cfg, dict):
-                if "require_mention" in telegram_cfg and not os.getenv("TELEGRAM_REQUIRE_MENTION"):
+                if "require_mention" in telegram_cfg and not _session_env("TELEGRAM_REQUIRE_MENTION"):
                     os.environ["TELEGRAM_REQUIRE_MENTION"] = str(telegram_cfg["require_mention"]).lower()
-                if "mention_patterns" in telegram_cfg and not os.getenv("TELEGRAM_MENTION_PATTERNS"):
+                if "mention_patterns" in telegram_cfg and not _session_env("TELEGRAM_MENTION_PATTERNS"):
                     import json as _json
                     os.environ["TELEGRAM_MENTION_PATTERNS"] = _json.dumps(telegram_cfg["mention_patterns"])
                 frc = telegram_cfg.get("free_response_chats")
-                if frc is not None and not os.getenv("TELEGRAM_FREE_RESPONSE_CHATS"):
+                if frc is not None and not _session_env("TELEGRAM_FREE_RESPONSE_CHATS"):
                     if isinstance(frc, list):
                         frc = ",".join(str(v) for v in frc)
                     os.environ["TELEGRAM_FREE_RESPONSE_CHATS"] = str(frc)
                 ignored_threads = telegram_cfg.get("ignored_threads")
-                if ignored_threads is not None and not os.getenv("TELEGRAM_IGNORED_THREADS"):
+                if ignored_threads is not None and not _session_env("TELEGRAM_IGNORED_THREADS"):
                     if isinstance(ignored_threads, list):
                         ignored_threads = ",".join(str(v) for v in ignored_threads)
                     os.environ["TELEGRAM_IGNORED_THREADS"] = str(ignored_threads)
-                if "reactions" in telegram_cfg and not os.getenv("TELEGRAM_REACTIONS"):
+                if "reactions" in telegram_cfg and not _session_env("TELEGRAM_REACTIONS"):
                     os.environ["TELEGRAM_REACTIONS"] = str(telegram_cfg["reactions"]).lower()
-                if "proxy_url" in telegram_cfg and not os.getenv("TELEGRAM_PROXY"):
+                if "proxy_url" in telegram_cfg and not _session_env("TELEGRAM_PROXY"):
                     os.environ["TELEGRAM_PROXY"] = str(telegram_cfg["proxy_url"]).strip()
                 if "disable_link_previews" in telegram_cfg:
                     plat_data = platforms_data.setdefault(Platform.TELEGRAM.value, {})
@@ -691,12 +701,12 @@ def load_gateway_config() -> GatewayConfig:
 
             whatsapp_cfg = yaml_cfg.get("whatsapp", {})
             if isinstance(whatsapp_cfg, dict):
-                if "require_mention" in whatsapp_cfg and not os.getenv("WHATSAPP_REQUIRE_MENTION"):
+                if "require_mention" in whatsapp_cfg and not _session_env("WHATSAPP_REQUIRE_MENTION"):
                     os.environ["WHATSAPP_REQUIRE_MENTION"] = str(whatsapp_cfg["require_mention"]).lower()
-                if "mention_patterns" in whatsapp_cfg and not os.getenv("WHATSAPP_MENTION_PATTERNS"):
+                if "mention_patterns" in whatsapp_cfg and not _session_env("WHATSAPP_MENTION_PATTERNS"):
                     os.environ["WHATSAPP_MENTION_PATTERNS"] = json.dumps(whatsapp_cfg["mention_patterns"])
                 frc = whatsapp_cfg.get("free_response_chats")
-                if frc is not None and not os.getenv("WHATSAPP_FREE_RESPONSE_CHATS"):
+                if frc is not None and not _session_env("WHATSAPP_FREE_RESPONSE_CHATS"):
                     if isinstance(frc, list):
                         frc = ",".join(str(v) for v in frc)
                     os.environ["WHATSAPP_FREE_RESPONSE_CHATS"] = str(frc)
@@ -704,17 +714,17 @@ def load_gateway_config() -> GatewayConfig:
             # DingTalk settings → env vars (env vars take precedence)
             dingtalk_cfg = yaml_cfg.get("dingtalk", {})
             if isinstance(dingtalk_cfg, dict):
-                if "require_mention" in dingtalk_cfg and not os.getenv("DINGTALK_REQUIRE_MENTION"):
+                if "require_mention" in dingtalk_cfg and not _session_env("DINGTALK_REQUIRE_MENTION"):
                     os.environ["DINGTALK_REQUIRE_MENTION"] = str(dingtalk_cfg["require_mention"]).lower()
-                if "mention_patterns" in dingtalk_cfg and not os.getenv("DINGTALK_MENTION_PATTERNS"):
+                if "mention_patterns" in dingtalk_cfg and not _session_env("DINGTALK_MENTION_PATTERNS"):
                     os.environ["DINGTALK_MENTION_PATTERNS"] = json.dumps(dingtalk_cfg["mention_patterns"])
                 frc = dingtalk_cfg.get("free_response_chats")
-                if frc is not None and not os.getenv("DINGTALK_FREE_RESPONSE_CHATS"):
+                if frc is not None and not _session_env("DINGTALK_FREE_RESPONSE_CHATS"):
                     if isinstance(frc, list):
                         frc = ",".join(str(v) for v in frc)
                     os.environ["DINGTALK_FREE_RESPONSE_CHATS"] = str(frc)
                 allowed = dingtalk_cfg.get("allowed_users")
-                if allowed is not None and not os.getenv("DINGTALK_ALLOWED_USERS"):
+                if allowed is not None and not _session_env("DINGTALK_ALLOWED_USERS"):
                     if isinstance(allowed, list):
                         allowed = ",".join(str(v) for v in allowed)
                     os.environ["DINGTALK_ALLOWED_USERS"] = str(allowed)
@@ -722,16 +732,16 @@ def load_gateway_config() -> GatewayConfig:
             # Matrix settings → env vars (env vars take precedence)
             matrix_cfg = yaml_cfg.get("matrix", {})
             if isinstance(matrix_cfg, dict):
-                if "require_mention" in matrix_cfg and not os.getenv("MATRIX_REQUIRE_MENTION"):
+                if "require_mention" in matrix_cfg and not _session_env("MATRIX_REQUIRE_MENTION"):
                     os.environ["MATRIX_REQUIRE_MENTION"] = str(matrix_cfg["require_mention"]).lower()
                 frc = matrix_cfg.get("free_response_rooms")
-                if frc is not None and not os.getenv("MATRIX_FREE_RESPONSE_ROOMS"):
+                if frc is not None and not _session_env("MATRIX_FREE_RESPONSE_ROOMS"):
                     if isinstance(frc, list):
                         frc = ",".join(str(v) for v in frc)
                     os.environ["MATRIX_FREE_RESPONSE_ROOMS"] = str(frc)
-                if "auto_thread" in matrix_cfg and not os.getenv("MATRIX_AUTO_THREAD"):
+                if "auto_thread" in matrix_cfg and not _session_env("MATRIX_AUTO_THREAD"):
                     os.environ["MATRIX_AUTO_THREAD"] = str(matrix_cfg["auto_thread"]).lower()
-                if "dm_mention_threads" in matrix_cfg and not os.getenv("MATRIX_DM_MENTION_THREADS"):
+                if "dm_mention_threads" in matrix_cfg and not _session_env("MATRIX_DM_MENTION_THREADS"):
                     os.environ["MATRIX_DM_MENTION_THREADS"] = str(matrix_cfg["dm_mention_threads"]).lower()
 
     except Exception as e:
@@ -826,7 +836,7 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
     """Apply environment variable overrides to config."""
     
     # Telegram
-    telegram_token = os.getenv("TELEGRAM_BOT_TOKEN")
+    telegram_token = _session_env("TELEGRAM_BOT_TOKEN")
     if telegram_token:
         if Platform.TELEGRAM not in config.platforms:
             config.platforms[Platform.TELEGRAM] = PlatformConfig()
@@ -834,13 +844,13 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         config.platforms[Platform.TELEGRAM].token = telegram_token
     
     # Reply threading mode for Telegram (off/first/all)
-    telegram_reply_mode = os.getenv("TELEGRAM_REPLY_TO_MODE", "").lower()
+    telegram_reply_mode = _session_env("TELEGRAM_REPLY_TO_MODE", "").lower()
     if telegram_reply_mode in ("off", "first", "all"):
         if Platform.TELEGRAM not in config.platforms:
             config.platforms[Platform.TELEGRAM] = PlatformConfig()
         config.platforms[Platform.TELEGRAM].reply_to_mode = telegram_reply_mode
     
-    telegram_fallback_ips = os.getenv("TELEGRAM_FALLBACK_IPS", "")
+    telegram_fallback_ips = _session_env("TELEGRAM_FALLBACK_IPS", "")
     if telegram_fallback_ips:
         if Platform.TELEGRAM not in config.platforms:
             config.platforms[Platform.TELEGRAM] = PlatformConfig()
@@ -848,62 +858,62 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             ip.strip() for ip in telegram_fallback_ips.split(",") if ip.strip()
         ]
 
-    telegram_home = os.getenv("TELEGRAM_HOME_CHANNEL")
+    telegram_home = _session_env("TELEGRAM_HOME_CHANNEL")
     if telegram_home and Platform.TELEGRAM in config.platforms:
         config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
             platform=Platform.TELEGRAM,
             chat_id=telegram_home,
-            name=os.getenv("TELEGRAM_HOME_CHANNEL_NAME", "Home"),
+            name=_session_env("TELEGRAM_HOME_CHANNEL_NAME", "Home"),
         )
     
     # Discord
-    discord_token = os.getenv("DISCORD_BOT_TOKEN")
+    discord_token = _session_env("DISCORD_BOT_TOKEN")
     if discord_token:
         if Platform.DISCORD not in config.platforms:
             config.platforms[Platform.DISCORD] = PlatformConfig()
         config.platforms[Platform.DISCORD].enabled = True
         config.platforms[Platform.DISCORD].token = discord_token
     
-    discord_home = os.getenv("DISCORD_HOME_CHANNEL")
+    discord_home = _session_env("DISCORD_HOME_CHANNEL")
     if discord_home and Platform.DISCORD in config.platforms:
         config.platforms[Platform.DISCORD].home_channel = HomeChannel(
             platform=Platform.DISCORD,
             chat_id=discord_home,
-            name=os.getenv("DISCORD_HOME_CHANNEL_NAME", "Home"),
+            name=_session_env("DISCORD_HOME_CHANNEL_NAME", "Home"),
         )
     
     # Reply threading mode for Discord (off/first/all)
-    discord_reply_mode = os.getenv("DISCORD_REPLY_TO_MODE", "").lower()
+    discord_reply_mode = _session_env("DISCORD_REPLY_TO_MODE", "").lower()
     if discord_reply_mode in ("off", "first", "all"):
         if Platform.DISCORD not in config.platforms:
             config.platforms[Platform.DISCORD] = PlatformConfig()
         config.platforms[Platform.DISCORD].reply_to_mode = discord_reply_mode
     
     # WhatsApp (typically uses different auth mechanism)
-    whatsapp_enabled = os.getenv("WHATSAPP_ENABLED", "").lower() in ("true", "1", "yes")
+    whatsapp_enabled = _session_env("WHATSAPP_ENABLED", "").lower() in ("true", "1", "yes")
     if whatsapp_enabled:
         if Platform.WHATSAPP not in config.platforms:
             config.platforms[Platform.WHATSAPP] = PlatformConfig()
         config.platforms[Platform.WHATSAPP].enabled = True
     
     # Slack
-    slack_token = os.getenv("SLACK_BOT_TOKEN")
+    slack_token = _session_env("SLACK_BOT_TOKEN")
     if slack_token:
         if Platform.SLACK not in config.platforms:
             config.platforms[Platform.SLACK] = PlatformConfig()
         config.platforms[Platform.SLACK].enabled = True
         config.platforms[Platform.SLACK].token = slack_token
-    slack_home = os.getenv("SLACK_HOME_CHANNEL")
+    slack_home = _session_env("SLACK_HOME_CHANNEL")
     if slack_home and Platform.SLACK in config.platforms:
         config.platforms[Platform.SLACK].home_channel = HomeChannel(
             platform=Platform.SLACK,
             chat_id=slack_home,
-            name=os.getenv("SLACK_HOME_CHANNEL_NAME", ""),
+            name=_session_env("SLACK_HOME_CHANNEL_NAME", ""),
         )
     
     # Signal
-    signal_url = os.getenv("SIGNAL_HTTP_URL")
-    signal_account = os.getenv("SIGNAL_ACCOUNT")
+    signal_url = _session_env("SIGNAL_HTTP_URL")
+    signal_account = _session_env("SIGNAL_ACCOUNT")
     if signal_url and signal_account:
         if Platform.SIGNAL not in config.platforms:
             config.platforms[Platform.SIGNAL] = PlatformConfig()
@@ -911,20 +921,20 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         config.platforms[Platform.SIGNAL].extra.update({
             "http_url": signal_url,
             "account": signal_account,
-            "ignore_stories": os.getenv("SIGNAL_IGNORE_STORIES", "true").lower() in ("true", "1", "yes"),
+            "ignore_stories": _session_env("SIGNAL_IGNORE_STORIES", "true").lower() in ("true", "1", "yes"),
         })
-    signal_home = os.getenv("SIGNAL_HOME_CHANNEL")
+    signal_home = _session_env("SIGNAL_HOME_CHANNEL")
     if signal_home and Platform.SIGNAL in config.platforms:
         config.platforms[Platform.SIGNAL].home_channel = HomeChannel(
             platform=Platform.SIGNAL,
             chat_id=signal_home,
-            name=os.getenv("SIGNAL_HOME_CHANNEL_NAME", "Home"),
+            name=_session_env("SIGNAL_HOME_CHANNEL_NAME", "Home"),
         )
 
     # Mattermost
-    mattermost_token = os.getenv("MATTERMOST_TOKEN")
+    mattermost_token = _session_env("MATTERMOST_TOKEN")
     if mattermost_token:
-        mattermost_url = os.getenv("MATTERMOST_URL", "")
+        mattermost_url = _session_env("MATTERMOST_URL", "")
         if not mattermost_url:
             logger.warning("MATTERMOST_TOKEN set but MATTERMOST_URL is missing")
         if Platform.MATTERMOST not in config.platforms:
@@ -932,18 +942,18 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         config.platforms[Platform.MATTERMOST].enabled = True
         config.platforms[Platform.MATTERMOST].token = mattermost_token
         config.platforms[Platform.MATTERMOST].extra["url"] = mattermost_url
-    mattermost_home = os.getenv("MATTERMOST_HOME_CHANNEL")
+    mattermost_home = _session_env("MATTERMOST_HOME_CHANNEL")
     if mattermost_home and Platform.MATTERMOST in config.platforms:
         config.platforms[Platform.MATTERMOST].home_channel = HomeChannel(
             platform=Platform.MATTERMOST,
             chat_id=mattermost_home,
-            name=os.getenv("MATTERMOST_HOME_CHANNEL_NAME", "Home"),
+            name=_session_env("MATTERMOST_HOME_CHANNEL_NAME", "Home"),
         )
 
     # Matrix
-    matrix_token = os.getenv("MATRIX_ACCESS_TOKEN")
-    matrix_homeserver = os.getenv("MATRIX_HOMESERVER", "")
-    if matrix_token or os.getenv("MATRIX_PASSWORD"):
+    matrix_token = _session_env("MATRIX_ACCESS_TOKEN")
+    matrix_homeserver = _session_env("MATRIX_HOMESERVER", "")
+    if matrix_token or _session_env("MATRIX_PASSWORD"):
         if not matrix_homeserver:
             logger.warning("MATRIX_ACCESS_TOKEN/MATRIX_PASSWORD set but MATRIX_HOMESERVER is missing")
         if Platform.MATRIX not in config.platforms:
@@ -952,41 +962,41 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         if matrix_token:
             config.platforms[Platform.MATRIX].token = matrix_token
         config.platforms[Platform.MATRIX].extra["homeserver"] = matrix_homeserver
-        matrix_user = os.getenv("MATRIX_USER_ID", "")
+        matrix_user = _session_env("MATRIX_USER_ID", "")
         if matrix_user:
             config.platforms[Platform.MATRIX].extra["user_id"] = matrix_user
-        matrix_password = os.getenv("MATRIX_PASSWORD", "")
+        matrix_password = _session_env("MATRIX_PASSWORD", "")
         if matrix_password:
             config.platforms[Platform.MATRIX].extra["password"] = matrix_password
-        matrix_e2ee = os.getenv("MATRIX_ENCRYPTION", "").lower() in ("true", "1", "yes")
+        matrix_e2ee = _session_env("MATRIX_ENCRYPTION", "").lower() in ("true", "1", "yes")
         config.platforms[Platform.MATRIX].extra["encryption"] = matrix_e2ee
-        matrix_device_id = os.getenv("MATRIX_DEVICE_ID", "")
+        matrix_device_id = _session_env("MATRIX_DEVICE_ID", "")
         if matrix_device_id:
             config.platforms[Platform.MATRIX].extra["device_id"] = matrix_device_id
-    matrix_home = os.getenv("MATRIX_HOME_ROOM")
+    matrix_home = _session_env("MATRIX_HOME_ROOM")
     if matrix_home and Platform.MATRIX in config.platforms:
         config.platforms[Platform.MATRIX].home_channel = HomeChannel(
             platform=Platform.MATRIX,
             chat_id=matrix_home,
-            name=os.getenv("MATRIX_HOME_ROOM_NAME", "Home"),
+            name=_session_env("MATRIX_HOME_ROOM_NAME", "Home"),
         )
 
     # Home Assistant
-    hass_token = os.getenv("HASS_TOKEN")
+    hass_token = _session_env("HASS_TOKEN")
     if hass_token:
         if Platform.HOMEASSISTANT not in config.platforms:
             config.platforms[Platform.HOMEASSISTANT] = PlatformConfig()
         config.platforms[Platform.HOMEASSISTANT].enabled = True
         config.platforms[Platform.HOMEASSISTANT].token = hass_token
-        hass_url = os.getenv("HASS_URL")
+        hass_url = _session_env("HASS_URL")
         if hass_url:
             config.platforms[Platform.HOMEASSISTANT].extra["url"] = hass_url
 
     # Email
-    email_addr = os.getenv("EMAIL_ADDRESS")
-    email_pwd = os.getenv("EMAIL_PASSWORD")
-    email_imap = os.getenv("EMAIL_IMAP_HOST")
-    email_smtp = os.getenv("EMAIL_SMTP_HOST")
+    email_addr = _session_env("EMAIL_ADDRESS")
+    email_pwd = _session_env("EMAIL_PASSWORD")
+    email_imap = _session_env("EMAIL_IMAP_HOST")
+    email_smtp = _session_env("EMAIL_SMTP_HOST")
     if all([email_addr, email_pwd, email_imap, email_smtp]):
         if Platform.EMAIL not in config.platforms:
             config.platforms[Platform.EMAIL] = PlatformConfig()
@@ -996,35 +1006,35 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             "imap_host": email_imap,
             "smtp_host": email_smtp,
         })
-    email_home = os.getenv("EMAIL_HOME_ADDRESS")
+    email_home = _session_env("EMAIL_HOME_ADDRESS")
     if email_home and Platform.EMAIL in config.platforms:
         config.platforms[Platform.EMAIL].home_channel = HomeChannel(
             platform=Platform.EMAIL,
             chat_id=email_home,
-            name=os.getenv("EMAIL_HOME_ADDRESS_NAME", "Home"),
+            name=_session_env("EMAIL_HOME_ADDRESS_NAME", "Home"),
         )
 
     # SMS (Twilio)
-    twilio_sid = os.getenv("TWILIO_ACCOUNT_SID")
+    twilio_sid = _session_env("TWILIO_ACCOUNT_SID")
     if twilio_sid:
         if Platform.SMS not in config.platforms:
             config.platforms[Platform.SMS] = PlatformConfig()
         config.platforms[Platform.SMS].enabled = True
-        config.platforms[Platform.SMS].api_key = os.getenv("TWILIO_AUTH_TOKEN", "")
-    sms_home = os.getenv("SMS_HOME_CHANNEL")
+        config.platforms[Platform.SMS].api_key = _session_env("TWILIO_AUTH_TOKEN", "")
+    sms_home = _session_env("SMS_HOME_CHANNEL")
     if sms_home and Platform.SMS in config.platforms:
         config.platforms[Platform.SMS].home_channel = HomeChannel(
             platform=Platform.SMS,
             chat_id=sms_home,
-            name=os.getenv("SMS_HOME_CHANNEL_NAME", "Home"),
+            name=_session_env("SMS_HOME_CHANNEL_NAME", "Home"),
         )
 
     # API Server
-    api_server_enabled = os.getenv("API_SERVER_ENABLED", "").lower() in ("true", "1", "yes")
-    api_server_key = os.getenv("API_SERVER_KEY", "")
-    api_server_cors_origins = os.getenv("API_SERVER_CORS_ORIGINS", "")
-    api_server_port = os.getenv("API_SERVER_PORT")
-    api_server_host = os.getenv("API_SERVER_HOST")
+    api_server_enabled = _session_env("API_SERVER_ENABLED", "").lower() in ("true", "1", "yes")
+    api_server_key = _session_env("API_SERVER_KEY", "")
+    api_server_cors_origins = _session_env("API_SERVER_CORS_ORIGINS", "")
+    api_server_port = _session_env("API_SERVER_PORT")
+    api_server_host = _session_env("API_SERVER_HOST")
     if api_server_enabled or api_server_key:
         if Platform.API_SERVER not in config.platforms:
             config.platforms[Platform.API_SERVER] = PlatformConfig()
@@ -1042,14 +1052,14 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
                 pass
         if api_server_host:
             config.platforms[Platform.API_SERVER].extra["host"] = api_server_host
-        api_server_model_name = os.getenv("API_SERVER_MODEL_NAME", "")
+        api_server_model_name = _session_env("API_SERVER_MODEL_NAME", "")
         if api_server_model_name:
             config.platforms[Platform.API_SERVER].extra["model_name"] = api_server_model_name
 
     # Webhook platform
-    webhook_enabled = os.getenv("WEBHOOK_ENABLED", "").lower() in ("true", "1", "yes")
-    webhook_port = os.getenv("WEBHOOK_PORT")
-    webhook_secret = os.getenv("WEBHOOK_SECRET", "")
+    webhook_enabled = _session_env("WEBHOOK_ENABLED", "").lower() in ("true", "1", "yes")
+    webhook_port = _session_env("WEBHOOK_PORT")
+    webhook_secret = _session_env("WEBHOOK_SECRET", "")
     if webhook_enabled:
         if Platform.WEBHOOK not in config.platforms:
             config.platforms[Platform.WEBHOOK] = PlatformConfig()
@@ -1063,8 +1073,8 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             config.platforms[Platform.WEBHOOK].extra["secret"] = webhook_secret
 
     # DingTalk
-    dingtalk_client_id = os.getenv("DINGTALK_CLIENT_ID")
-    dingtalk_client_secret = os.getenv("DINGTALK_CLIENT_SECRET")
+    dingtalk_client_id = _session_env("DINGTALK_CLIENT_ID")
+    dingtalk_client_secret = _session_env("DINGTALK_CLIENT_SECRET")
     if dingtalk_client_id and dingtalk_client_secret:
         if Platform.DINGTALK not in config.platforms:
             config.platforms[Platform.DINGTALK] = PlatformConfig()
@@ -1073,17 +1083,17 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             "client_id": dingtalk_client_id,
             "client_secret": dingtalk_client_secret,
         })
-        dingtalk_home = os.getenv("DINGTALK_HOME_CHANNEL")
+        dingtalk_home = _session_env("DINGTALK_HOME_CHANNEL")
         if dingtalk_home:
             config.platforms[Platform.DINGTALK].home_channel = HomeChannel(
                 platform=Platform.DINGTALK,
                 chat_id=dingtalk_home,
-                name=os.getenv("DINGTALK_HOME_CHANNEL_NAME", "Home"),
+                name=_session_env("DINGTALK_HOME_CHANNEL_NAME", "Home"),
             )
 
     # Feishu / Lark
-    feishu_app_id = os.getenv("FEISHU_APP_ID")
-    feishu_app_secret = os.getenv("FEISHU_APP_SECRET")
+    feishu_app_id = _session_env("FEISHU_APP_ID")
+    feishu_app_secret = _session_env("FEISHU_APP_SECRET")
     if feishu_app_id and feishu_app_secret:
         if Platform.FEISHU not in config.platforms:
             config.platforms[Platform.FEISHU] = PlatformConfig()
@@ -1091,26 +1101,26 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         config.platforms[Platform.FEISHU].extra.update({
             "app_id": feishu_app_id,
             "app_secret": feishu_app_secret,
-            "domain": os.getenv("FEISHU_DOMAIN", "feishu"),
-            "connection_mode": os.getenv("FEISHU_CONNECTION_MODE", "websocket"),
+            "domain": _session_env("FEISHU_DOMAIN", "feishu"),
+            "connection_mode": _session_env("FEISHU_CONNECTION_MODE", "websocket"),
         })
-        feishu_encrypt_key = os.getenv("FEISHU_ENCRYPT_KEY", "")
+        feishu_encrypt_key = _session_env("FEISHU_ENCRYPT_KEY", "")
         if feishu_encrypt_key:
             config.platforms[Platform.FEISHU].extra["encrypt_key"] = feishu_encrypt_key
-        feishu_verification_token = os.getenv("FEISHU_VERIFICATION_TOKEN", "")
+        feishu_verification_token = _session_env("FEISHU_VERIFICATION_TOKEN", "")
         if feishu_verification_token:
             config.platforms[Platform.FEISHU].extra["verification_token"] = feishu_verification_token
-        feishu_home = os.getenv("FEISHU_HOME_CHANNEL")
+        feishu_home = _session_env("FEISHU_HOME_CHANNEL")
         if feishu_home:
             config.platforms[Platform.FEISHU].home_channel = HomeChannel(
                 platform=Platform.FEISHU,
                 chat_id=feishu_home,
-                name=os.getenv("FEISHU_HOME_CHANNEL_NAME", "Home"),
+                name=_session_env("FEISHU_HOME_CHANNEL_NAME", "Home"),
             )
 
     # WeCom (Enterprise WeChat)
-    wecom_bot_id = os.getenv("WECOM_BOT_ID")
-    wecom_secret = os.getenv("WECOM_SECRET")
+    wecom_bot_id = _session_env("WECOM_BOT_ID")
+    wecom_secret = _session_env("WECOM_SECRET")
     if wecom_bot_id and wecom_secret:
         if Platform.WECOM not in config.platforms:
             config.platforms[Platform.WECOM] = PlatformConfig()
@@ -1119,20 +1129,20 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             "bot_id": wecom_bot_id,
             "secret": wecom_secret,
         })
-        wecom_ws_url = os.getenv("WECOM_WEBSOCKET_URL", "")
+        wecom_ws_url = _session_env("WECOM_WEBSOCKET_URL", "")
         if wecom_ws_url:
             config.platforms[Platform.WECOM].extra["websocket_url"] = wecom_ws_url
-        wecom_home = os.getenv("WECOM_HOME_CHANNEL")
+        wecom_home = _session_env("WECOM_HOME_CHANNEL")
         if wecom_home:
             config.platforms[Platform.WECOM].home_channel = HomeChannel(
                 platform=Platform.WECOM,
                 chat_id=wecom_home,
-                name=os.getenv("WECOM_HOME_CHANNEL_NAME", "Home"),
+                name=_session_env("WECOM_HOME_CHANNEL_NAME", "Home"),
             )
 
     # WeCom callback mode (self-built apps)
-    wecom_callback_corp_id = os.getenv("WECOM_CALLBACK_CORP_ID")
-    wecom_callback_corp_secret = os.getenv("WECOM_CALLBACK_CORP_SECRET")
+    wecom_callback_corp_id = _session_env("WECOM_CALLBACK_CORP_ID")
+    wecom_callback_corp_secret = _session_env("WECOM_CALLBACK_CORP_SECRET")
     if wecom_callback_corp_id and wecom_callback_corp_secret:
         if Platform.WECOM_CALLBACK not in config.platforms:
             config.platforms[Platform.WECOM_CALLBACK] = PlatformConfig()
@@ -1140,16 +1150,16 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         config.platforms[Platform.WECOM_CALLBACK].extra.update({
             "corp_id": wecom_callback_corp_id,
             "corp_secret": wecom_callback_corp_secret,
-            "agent_id": os.getenv("WECOM_CALLBACK_AGENT_ID", ""),
-            "token": os.getenv("WECOM_CALLBACK_TOKEN", ""),
-            "encoding_aes_key": os.getenv("WECOM_CALLBACK_ENCODING_AES_KEY", ""),
-            "host": os.getenv("WECOM_CALLBACK_HOST", "0.0.0.0"),
-            "port": int(os.getenv("WECOM_CALLBACK_PORT", "8645")),
+            "agent_id": _session_env("WECOM_CALLBACK_AGENT_ID", ""),
+            "token": _session_env("WECOM_CALLBACK_TOKEN", ""),
+            "encoding_aes_key": _session_env("WECOM_CALLBACK_ENCODING_AES_KEY", ""),
+            "host": _session_env("WECOM_CALLBACK_HOST", "0.0.0.0"),
+            "port": int(_session_env("WECOM_CALLBACK_PORT", "8645")),
         })
 
     # Weixin (personal WeChat via iLink Bot API)
-    weixin_token = os.getenv("WEIXIN_TOKEN")
-    weixin_account_id = os.getenv("WEIXIN_ACCOUNT_ID")
+    weixin_token = _session_env("WEIXIN_TOKEN")
+    weixin_account_id = _session_env("WEIXIN_ACCOUNT_ID")
     if weixin_token or weixin_account_id:
         if Platform.WEIXIN not in config.platforms:
             config.platforms[Platform.WEIXIN] = PlatformConfig()
@@ -1159,38 +1169,38 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         extra = config.platforms[Platform.WEIXIN].extra
         if weixin_account_id:
             extra["account_id"] = weixin_account_id
-        weixin_base_url = os.getenv("WEIXIN_BASE_URL", "").strip()
+        weixin_base_url = _session_env("WEIXIN_BASE_URL", "").strip()
         if weixin_base_url:
             extra["base_url"] = weixin_base_url.rstrip("/")
-        weixin_cdn_base_url = os.getenv("WEIXIN_CDN_BASE_URL", "").strip()
+        weixin_cdn_base_url = _session_env("WEIXIN_CDN_BASE_URL", "").strip()
         if weixin_cdn_base_url:
             extra["cdn_base_url"] = weixin_cdn_base_url.rstrip("/")
-        weixin_dm_policy = os.getenv("WEIXIN_DM_POLICY", "").strip().lower()
+        weixin_dm_policy = _session_env("WEIXIN_DM_POLICY", "").strip().lower()
         if weixin_dm_policy:
             extra["dm_policy"] = weixin_dm_policy
-        weixin_group_policy = os.getenv("WEIXIN_GROUP_POLICY", "").strip().lower()
+        weixin_group_policy = _session_env("WEIXIN_GROUP_POLICY", "").strip().lower()
         if weixin_group_policy:
             extra["group_policy"] = weixin_group_policy
-        weixin_allowed_users = os.getenv("WEIXIN_ALLOWED_USERS", "").strip()
+        weixin_allowed_users = _session_env("WEIXIN_ALLOWED_USERS", "").strip()
         if weixin_allowed_users:
             extra["allow_from"] = weixin_allowed_users
-        weixin_group_allowed_users = os.getenv("WEIXIN_GROUP_ALLOWED_USERS", "").strip()
+        weixin_group_allowed_users = _session_env("WEIXIN_GROUP_ALLOWED_USERS", "").strip()
         if weixin_group_allowed_users:
             extra["group_allow_from"] = weixin_group_allowed_users
-        weixin_split_multiline = os.getenv("WEIXIN_SPLIT_MULTILINE_MESSAGES", "").strip()
+        weixin_split_multiline = _session_env("WEIXIN_SPLIT_MULTILINE_MESSAGES", "").strip()
         if weixin_split_multiline:
             extra["split_multiline_messages"] = weixin_split_multiline
-        weixin_home = os.getenv("WEIXIN_HOME_CHANNEL", "").strip()
+        weixin_home = _session_env("WEIXIN_HOME_CHANNEL", "").strip()
         if weixin_home:
             config.platforms[Platform.WEIXIN].home_channel = HomeChannel(
                 platform=Platform.WEIXIN,
                 chat_id=weixin_home,
-                name=os.getenv("WEIXIN_HOME_CHANNEL_NAME", "Home"),
+                name=_session_env("WEIXIN_HOME_CHANNEL_NAME", "Home"),
             )
 
     # BlueBubbles (iMessage)
-    bluebubbles_server_url = os.getenv("BLUEBUBBLES_SERVER_URL")
-    bluebubbles_password = os.getenv("BLUEBUBBLES_PASSWORD")
+    bluebubbles_server_url = _session_env("BLUEBUBBLES_SERVER_URL")
+    bluebubbles_password = _session_env("BLUEBUBBLES_PASSWORD")
     if bluebubbles_server_url and bluebubbles_password:
         if Platform.BLUEBUBBLES not in config.platforms:
             config.platforms[Platform.BLUEBUBBLES] = PlatformConfig()
@@ -1198,22 +1208,22 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         config.platforms[Platform.BLUEBUBBLES].extra.update({
             "server_url": bluebubbles_server_url.rstrip("/"),
             "password": bluebubbles_password,
-            "webhook_host": os.getenv("BLUEBUBBLES_WEBHOOK_HOST", "127.0.0.1"),
-            "webhook_port": int(os.getenv("BLUEBUBBLES_WEBHOOK_PORT", "8645")),
-            "webhook_path": os.getenv("BLUEBUBBLES_WEBHOOK_PATH", "/bluebubbles-webhook"),
-            "send_read_receipts": os.getenv("BLUEBUBBLES_SEND_READ_RECEIPTS", "true").lower() in ("true", "1", "yes"),
+            "webhook_host": _session_env("BLUEBUBBLES_WEBHOOK_HOST", "127.0.0.1"),
+            "webhook_port": int(_session_env("BLUEBUBBLES_WEBHOOK_PORT", "8645")),
+            "webhook_path": _session_env("BLUEBUBBLES_WEBHOOK_PATH", "/bluebubbles-webhook"),
+            "send_read_receipts": _session_env("BLUEBUBBLES_SEND_READ_RECEIPTS", "true").lower() in ("true", "1", "yes"),
         })
-    bluebubbles_home = os.getenv("BLUEBUBBLES_HOME_CHANNEL")
+    bluebubbles_home = _session_env("BLUEBUBBLES_HOME_CHANNEL")
     if bluebubbles_home and Platform.BLUEBUBBLES in config.platforms:
         config.platforms[Platform.BLUEBUBBLES].home_channel = HomeChannel(
             platform=Platform.BLUEBUBBLES,
             chat_id=bluebubbles_home,
-            name=os.getenv("BLUEBUBBLES_HOME_CHANNEL_NAME", "Home"),
+            name=_session_env("BLUEBUBBLES_HOME_CHANNEL_NAME", "Home"),
         )
 
     # QQ (Official Bot API v2)
-    qq_app_id = os.getenv("QQ_APP_ID")
-    qq_client_secret = os.getenv("QQ_CLIENT_SECRET")
+    qq_app_id = _session_env("QQ_APP_ID")
+    qq_client_secret = _session_env("QQ_CLIENT_SECRET")
     if qq_app_id or qq_client_secret:
         if Platform.QQBOT not in config.platforms:
             config.platforms[Platform.QQBOT] = PlatformConfig()
@@ -1223,17 +1233,17 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             extra["app_id"] = qq_app_id
         if qq_client_secret:
             extra["client_secret"] = qq_client_secret
-        qq_allowed_users = os.getenv("QQ_ALLOWED_USERS", "").strip()
+        qq_allowed_users = _session_env("QQ_ALLOWED_USERS", "").strip()
         if qq_allowed_users:
             extra["allow_from"] = qq_allowed_users
-        qq_group_allowed = os.getenv("QQ_GROUP_ALLOWED_USERS", "").strip()
+        qq_group_allowed = _session_env("QQ_GROUP_ALLOWED_USERS", "").strip()
         if qq_group_allowed:
             extra["group_allow_from"] = qq_group_allowed
-        qq_home = os.getenv("QQBOT_HOME_CHANNEL", "").strip()
+        qq_home = _session_env("QQBOT_HOME_CHANNEL", "").strip()
         qq_home_name_env = "QQBOT_HOME_CHANNEL_NAME"
         if not qq_home:
             # Back-compat: accept the pre-rename name and log a one-time warning.
-            legacy_home = os.getenv("QQ_HOME_CHANNEL", "").strip()
+            legacy_home = _session_env("QQ_HOME_CHANNEL", "").strip()
             if legacy_home:
                 qq_home = legacy_home
                 qq_home_name_env = "QQ_HOME_CHANNEL_NAME"
@@ -1246,18 +1256,18 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             config.platforms[Platform.QQBOT].home_channel = HomeChannel(
                 platform=Platform.QQBOT,
                 chat_id=qq_home,
-                name=os.getenv("QQBOT_HOME_CHANNEL_NAME") or os.getenv(qq_home_name_env, "Home"),
+                name=_session_env("QQBOT_HOME_CHANNEL_NAME") or _session_env(qq_home_name_env, "Home"),
             )
 
     # Session settings
-    idle_minutes = os.getenv("SESSION_IDLE_MINUTES")
+    idle_minutes = _session_env("SESSION_IDLE_MINUTES")
     if idle_minutes:
         try:
             config.default_reset_policy.idle_minutes = int(idle_minutes)
         except ValueError:
             pass
     
-    reset_hour = os.getenv("SESSION_RESET_HOUR")
+    reset_hour = _session_env("SESSION_RESET_HOUR")
     if reset_hour:
         try:
             config.default_reset_policy.at_hour = int(reset_hour)

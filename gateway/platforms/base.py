@@ -156,13 +156,15 @@ def resolve_proxy_url(platform_env_var: str | None = None) -> str | None:
 
     Returns *None* if no proxy is found.
     """
+    from gateway.config import _session_env
+
     if platform_env_var:
-        value = (os.environ.get(platform_env_var) or "").strip()
+        value = (_session_env(platform_env_var, "") or "").strip()
         if value:
             return value
     for key in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY",
                 "https_proxy", "http_proxy", "all_proxy"):
-        value = (os.environ.get(key) or "").strip()
+        value = (_session_env(key, "") or "").strip()
         if value:
             return value
     return _detect_macos_system_proxy()
@@ -1832,7 +1834,7 @@ class BasePlatformAdapter(ABC):
             if response:
                 # Extract MEDIA:<path> tags (from TTS tool) before other processing
                 media_files, response = self.extract_media(response)
-                
+
                 # Extract image URLs and send them as native platform attachments
                 images, text_content = self.extract_images(response)
                 # Strip any remaining internal directives from message body (fixes #1561)
@@ -1846,6 +1848,45 @@ class BasePlatformAdapter(ABC):
                 local_files, text_content = self.extract_local_files(text_content)
                 if local_files:
                     logger.info("[%s] extract_local_files found %d file(s) in response", self.name, len(local_files))
+
+                from tools.send_message_tool import _validate_media_files, _validate_media_path
+                blocked_attachment_errors = []
+                safe_images = []
+                for image_url, alt_text in images:
+                    if image_url.startswith(("/", "~")):
+                        image_error = _validate_media_path(image_url)
+                        if image_error:
+                            logger.warning("[%s] Blocking local image delivery: %s", self.name, image_error)
+                            blocked_attachment_errors.append(image_error)
+                            continue
+                    safe_images.append((image_url, alt_text))
+                images = safe_images
+
+                media_error = _validate_media_files(media_files)
+                if media_error:
+                    logger.warning("[%s] Blocking response media delivery: %s", self.name, media_error)
+                    blocked_attachment_errors.append(media_error)
+                    media_files = []
+
+                safe_local_files = []
+                for file_path in local_files:
+                    file_error = _validate_media_path(file_path)
+                    if file_error:
+                        logger.warning("[%s] Blocking local file delivery: %s", self.name, file_error)
+                        blocked_attachment_errors.append(file_error)
+                        continue
+                    safe_local_files.append(file_path)
+                local_files = safe_local_files
+
+                if blocked_attachment_errors:
+                    blocked_attachment_notice = (
+                        "⚠️ Hermes blocked one or more file attachments for safety. "
+                        "Regenerate the artifact in this session before trying to send it again."
+                    )
+                    if text_content:
+                        text_content = f"{text_content}\n\n{blocked_attachment_notice}"
+                    else:
+                        text_content = blocked_attachment_notice
                 
                 # Auto-TTS: if voice message, generate audio FIRST (before sending text)
                 # Skipped when the chat has voice mode disabled (/voice off)

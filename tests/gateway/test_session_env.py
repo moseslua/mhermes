@@ -17,17 +17,13 @@ from gateway.session_context import (
 
 @pytest.fixture(autouse=True)
 def _reset_contextvars():
-    """Reset all session contextvars to _UNSET between tests.
-
-    In production each asyncio.Task gets a fresh context copy where the
-    defaults are _UNSET.  In tests all functions share the same thread
-    context, so a clear_session_vars() from test A (which sets vars to "")
-    would leak into test B.  This fixture ensures each test starts clean.
-    """
+    """Reset all session contextvars to _UNSET before and after each test."""
+    for var in _VAR_MAP.values():
+        var.set(_UNSET)
     yield
     for var in _VAR_MAP.values():
-        # Can't use var.reset() without a token; just set back to sentinel.
         var.set(_UNSET)
+
 
 
 def test_set_session_env_sets_contextvars(monkeypatch):
@@ -97,7 +93,7 @@ def test_clear_session_env_restores_previous_state(monkeypatch):
 
     runner._clear_session_env(tokens)
 
-    # After clear, contextvars should return to defaults (empty)
+    # After clear, contextvars should return to explicit empty values.
     assert get_session_env("HERMES_SESSION_PLATFORM") == ""
     assert get_session_env("HERMES_SESSION_CHAT_ID") == ""
     assert get_session_env("HERMES_SESSION_CHAT_NAME") == ""
@@ -118,8 +114,7 @@ def test_get_session_env_falls_back_to_os_environ(monkeypatch):
     assert get_session_env("HERMES_SESSION_PLATFORM") == "telegram"
 
     # After clear — should return "" (explicitly cleared), NOT fall back
-    # to os.environ.  This is the fix for #10304: stale os.environ values
-    # must not leak through after a gateway session is cleaned up.
+    # to os.environ. This prevents stale session values from leaking through.
     clear_session_vars(tokens)
     assert get_session_env("HERMES_SESSION_PLATFORM") == ""
 
@@ -185,7 +180,7 @@ def test_session_key_falls_back_to_os_environ(monkeypatch):
     tokens = set_session_vars(session_key="ctx-session-456")
     assert get_session_env("HERMES_SESSION_KEY") == "ctx-session-456"
 
-    # After clear — should return "" (explicitly cleared), not os.environ (#10304)
+    # After clear — should return "" (explicitly cleared), not os.environ.
     clear_session_vars(tokens)
     assert get_session_env("HERMES_SESSION_KEY") == ""
 

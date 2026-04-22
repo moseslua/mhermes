@@ -234,6 +234,106 @@ class TestJobCRUD:
         assert job["deliver"] == "local"
 
 
+    def test_create_reactive_only_job(self, tmp_cron_dir):
+        source = create_job(prompt="Source", schedule="every 1h")
+        repair = create_job(
+            prompt="Repair the failing job",
+            reactive_trigger={
+                "job_id": source["id"],
+                "after_consecutive_failures": 2,
+            },
+        )
+
+        assert repair["schedule"] is None
+        assert repair["schedule_display"] == "reactive"
+        assert repair["state"] == "reactive_waiting"
+        assert repair["reactive_trigger"]["job_id"] == source["id"]
+        assert repair["reactive_trigger"]["after_consecutive_failures"] == 2
+        assert repair["health"]["total_runs"] == 0
+
+class TestReactiveTriggerValidation:
+    def test_create_reactive_job_requires_existing_source(self, tmp_cron_dir):
+        with pytest.raises(ValueError, match="Reactive trigger source job"):
+            create_job(
+                prompt="Repair",
+                reactive_trigger={
+                    "job_id": "missing-job",
+                    "after_consecutive_failures": 1,
+                },
+            )
+
+
+    def test_create_reactive_job_rejects_reactive_source(self, tmp_cron_dir):
+        source = create_job(prompt="Source", schedule="every 1h")
+        reactive = create_job(
+            prompt="Reactive source",
+            reactive_trigger={
+                "job_id": source["id"],
+                "after_consecutive_failures": 1,
+            },
+        )
+        with pytest.raises(ValueError, match="must not itself be reactive"):
+            create_job(
+                prompt="Repair",
+                reactive_trigger={
+                    "job_id": reactive["id"],
+                    "after_consecutive_failures": 1,
+                },
+            )
+
+    def test_create_rejects_mixed_schedule_and_reactive_mode(self, tmp_cron_dir):
+        source = create_job(prompt="Source", schedule="every 1h")
+        with pytest.raises(ValueError, match="both scheduled and reactive"):
+            create_job(
+                prompt="Repair",
+                schedule="every 1h",
+                reactive_trigger={
+                    "job_id": source["id"],
+                    "after_consecutive_failures": 1,
+                },
+            )
+
+    def test_update_rejects_job_without_schedule_or_trigger(self, tmp_cron_dir):
+        job = create_job(prompt="Check", schedule="every 1h")
+        with pytest.raises(ValueError, match="either a schedule or a reactive trigger"):
+            update_job(job["id"], {"schedule": None})
+
+class TestReactiveTriggerIntegrity:
+    def test_remove_job_rejects_orphaning_reactive_dependents(self, tmp_cron_dir):
+        source = create_job(prompt="Source", schedule="every 1h")
+        create_job(
+            prompt="Repair",
+            reactive_trigger={
+                "job_id": source["id"],
+                "after_consecutive_failures": 1,
+            },
+        )
+        with pytest.raises(RuntimeError, match="reactive dependents"):
+            remove_job(source["id"])
+
+class TestReactiveGraphIntegrity:
+    def test_update_rejects_turning_source_with_dependents_reactive(self, tmp_cron_dir):
+        source = create_job(prompt="Source", schedule="every 1h")
+        create_job(
+            prompt="Repair",
+            reactive_trigger={
+                "job_id": source["id"],
+                "after_consecutive_failures": 1,
+            },
+        )
+        other = create_job(prompt="Other", schedule="every 1h")
+        with pytest.raises(ValueError, match="dependents"):
+            update_job(
+                source["id"],
+                {
+                    "schedule": None,
+                    "reactive_trigger": {
+                        "job_id": other["id"],
+                        "after_consecutive_failures": 1,
+                    },
+                },
+            )
+
 class TestUpdateJob:
     def test_update_name(self, tmp_cron_dir):
         job = create_job(prompt="Check server status", schedule="every 1h", name="Old Name")
@@ -279,6 +379,27 @@ class TestUpdateJob:
         result = update_job("nonexistent_id", {"name": "X"})
         assert result is None
 
+
+    def test_update_reactive_trigger_rejects_cycle(self, tmp_cron_dir):
+        source = create_job(prompt="Source", schedule="every 1h")
+        repair = create_job(
+            prompt="Repair",
+            reactive_trigger={
+                "job_id": source["id"],
+                "after_consecutive_failures": 1,
+            },
+        )
+
+        with pytest.raises(ValueError, match="reactive"):
+            update_job(
+                source["id"],
+                {
+                    "reactive_trigger": {
+                        "job_id": repair["id"],
+                        "after_consecutive_failures": 1,
+                    }
+                },
+            )
 
 class TestPauseResumeJob:
     def test_pause_sets_state(self, tmp_cron_dir):
@@ -369,6 +490,49 @@ class TestMarkJobRun:
         assert updated["last_error"] == "model timeout"
         assert updated["last_delivery_error"] == "platform 'discord' not enabled"
 
+
+    def test_repeat_limited_interval_failure_stops_after_cap(self, tmp_cron_dir):
+        job = create_job(prompt="Limited", schedule="every 1h", repeat=1)
+        mark_job_run(job["id"], success=False, error="boom")
+        updated = get_job(job["id"])
+        assert updated is not None
+        assert updated["state"] == "completed"
+        assert updated["enabled"] is False
+        assert updated["next_run_at"] is None
+
+    def test_health_metrics_track_success_and_failure(self, tmp_cron_dir):
+        job = create_job(prompt="Health", schedule="every 1h")
+
+        mark_job_run(job["id"], success=False, error="timeout")
+        failed = get_job(job["id"])
+        assert failed["health"]["total_runs"] == 1
+        assert failed["health"]["total_failures"] == 1
+        assert failed["health"]["consecutive_failures"] == 1
+        assert failed["health"]["success_rate"] == 0.0
+        assert failed["health"]["last_failure_at"] is not None
+
+        mark_job_run(job["id"], success=True)
+        succeeded = get_job(job["id"])
+        assert succeeded["health"]["total_runs"] == 2
+        assert succeeded["health"]["total_successes"] == 1
+        assert succeeded["health"]["consecutive_failures"] == 0
+        assert succeeded["health"]["success_rate"] == 0.5
+        assert succeeded["health"]["last_success_at"] is not None
+
+    def test_reactive_only_job_returns_to_waiting_state_after_run(self, tmp_cron_dir):
+        source = create_job(prompt="Source", schedule="every 1h")
+        repair = create_job(
+            prompt="Repair",
+            reactive_trigger={
+                "job_id": source["id"],
+                "after_consecutive_failures": 1,
+            },
+        )
+
+        mark_job_run(repair["id"], success=True)
+        updated = get_job(repair["id"])
+        assert updated["state"] == "reactive_waiting"
+        assert updated["next_run_at"] is None
 
 class TestAdvanceNextRun:
     """Tests for advance_next_run() — crash-safety for recurring jobs."""
@@ -566,6 +730,114 @@ class TestGetDueJobs:
         assert get_job("oneshot-stale")["next_run_at"] is None
 
 
+    def test_reactive_trigger_fires_once_per_failure_event(self, tmp_cron_dir):
+        source = create_job(prompt="Source", schedule="every 1h")
+        repair = create_job(
+            prompt="Repair",
+            reactive_trigger={
+                "job_id": source["id"],
+                "after_consecutive_failures": 2,
+            },
+        )
+
+        mark_job_run(source["id"], success=False, error="boom-1")
+        assert get_due_jobs() == []
+
+        mark_job_run(source["id"], success=False, error="boom-2")
+        due = get_due_jobs()
+        assert [job["id"] for job in due] == [repair["id"]]
+
+        # The failure event is not consumed until the repair job actually runs
+        due_again_before_run = get_due_jobs()
+        assert [job["id"] for job in due_again_before_run] == [repair["id"]]
+
+        mark_job_run(
+            repair["id"],
+            success=True,
+            reactive_failure_at=due[0]["_reactive_failure_at"],
+        )
+        assert get_due_jobs() == []
+
+        # Reset by success, then a new failure streak can trigger again
+        mark_job_run(source["id"], success=True)
+        mark_job_run(source["id"], success=False, error="boom-3")
+        assert get_due_jobs() == []
+        mark_job_run(source["id"], success=False, error="boom-4")
+        due_again = get_due_jobs()
+        assert [job["id"] for job in due_again] == [repair["id"]]
+
+    def test_failed_repair_does_not_consume_source_failure(self, tmp_cron_dir):
+        source = create_job(prompt="Source", schedule="every 1h")
+        repair = create_job(
+            prompt="Repair",
+            reactive_trigger={
+                "job_id": source["id"],
+                "after_consecutive_failures": 1,
+            },
+        )
+
+        mark_job_run(source["id"], success=False, error="boom")
+        due = get_due_jobs()
+        assert [job["id"] for job in due] == [repair["id"]]
+
+        mark_job_run(
+            repair["id"],
+            success=False,
+            error="repair failed",
+            reactive_failure_at=due[0]["_reactive_failure_at"],
+        )
+        due_again = get_due_jobs()
+        assert [job["id"] for job in due_again] == [repair["id"]]
+
+
+class TestLegacyJobNormalization:
+    def test_old_jobs_without_health_or_trigger_fields_are_normalized(self, tmp_cron_dir):
+        save_jobs([
+            {
+                "id": "legacy-job",
+                "name": "Legacy",
+                "prompt": "Check",
+                "schedule": {"kind": "interval", "minutes": 60, "display": "every 60m"},
+                "schedule_display": "every 60m",
+                "repeat": {"times": None, "completed": 0},
+                "enabled": True,
+                "state": "scheduled",
+                "paused_at": None,
+                "paused_reason": None,
+                "created_at": datetime.now().isoformat(),
+                "next_run_at": datetime.now().isoformat(),
+                "last_run_at": None,
+                "last_status": None,
+                "last_error": None,
+                "last_delivery_error": None,
+                "deliver": "local",
+                "origin": None,
+            }
+        ])
+
+        fetched = get_job("legacy-job")
+        assert fetched is not None
+        assert fetched["health"]["total_runs"] == 0
+        assert fetched["reactive_trigger"] is None
+        assert list_jobs()[0]["health"]["consecutive_failures"] == 0
+
+
+    def test_terminal_failure_of_one_shot_source_still_allows_reactive_follow_up(self, tmp_cron_dir):
+        source = create_job(prompt="One-shot source", schedule="30m", repeat=1)
+        repair = create_job(
+            prompt="Repair terminal failure",
+            reactive_trigger={
+                "job_id": source["id"],
+                "after_consecutive_failures": 1,
+            },
+        )
+
+        mark_job_run(source["id"], success=False, error="oneshot-failed")
+        updated_source = get_job(source["id"])
+        assert updated_source is not None
+        assert updated_source["state"] == "completed"
+        due = get_due_jobs()
+        assert [job["id"] for job in due] == [repair["id"]]
 class TestSaveJobOutput:
     def test_creates_output_file(self, tmp_cron_dir):
         output_file = save_job_output("test123", "# Results\nEverything ok.")

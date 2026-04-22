@@ -1,0 +1,152 @@
+%% HMAOM Fault Tolerance & Recovery System
+%% Failure detection, escalation levels, circuit breaker, checkpointing
+
+graph TB
+    subgraph DETECTION["🔍 FAILURE DETECTION"]
+        direction LR
+        F1["⚠️ Tool Error<br/>exit != 0 | timeout | malformed"]
+        F2["👻 Hallucination<br/>schema validation fails"]
+        F3["🔄 Misrouting<br/>specialist reports 'out of domain'"]
+        F4["⏱️ Timeout<br/>wall time exceeded"]
+        F5["💸 Budget Exhaustion<br/>tokens | time | cost limit"]
+        F6["🔥 Cascading Failure<br/>multiple specialists fail"]
+    end
+
+    DETECT["🔍 DETECT<br/>Monitor all agents<br/>Correlation ID tracking"]
+
+    subgraph ESCALATION["📈 ESCALATION LEVELS"]
+        direction TB
+
+        subgraph L1["Level 1: RETRY 🟢"]
+            L1_DESC["Same agent<br/>Same task<br/>Try again"]
+            L1_COND["Applies to:<br/>• Network transient<br/>• Timeout < 30s<br/>• Rate limit hit"]
+        end
+
+        subgraph L2["Level 2: REPLAN 🟡"]
+            L2_DESC["Meta-agent rewrites<br/>task description<br/>Based on failure reason"]
+            L2_COND["Applies to:<br/>• Wrong approach<br/>• Tool mismatch<br/>• Ambiguous task"]
+        end
+
+        subgraph L3["Level 3: DECOMPOSE 🟠"]
+            L3_DESC["Break into smaller<br/>subtasks<br/>Spawn smaller agents"]
+            L3_COND["Applies to:<br/>• Task too complex<br/>• Max depth reached<br/>• Partial failure"]
+        end
+
+        subgraph L4["Level 4: ESCALATE 🔴"]
+            L4_DESC["Notify user with:<br/>• What was attempted<br/>• What failed<br/>• Partial results<br/>• Suggested next steps"]
+            L4_COND["Applies to:<br/>• All retries exhausted<br/>• Circuit breaker OPEN<br/>• User confirmation needed"]
+        end
+    end
+
+    subgraph CIRCUIT["🔒 CIRCUIT BREAKER"]
+        direction TB
+        CB_CLOSED["🟢 CLOSED<br/>Pass through<br/>Normal operation"]
+        CB_OPEN["🔴 OPEN<br/>Block requests<br/>Route to alternative"]
+        CB_HALF["🟡 HALF-OPEN<br/>Test with N calls<br/>Limited traffic"]
+
+        CB_CLOSED -->|"5 consecutive<br/>failures"| CB_OPEN
+        CB_OPEN -->|"30s timeout<br/>elapsed"| CB_HALF
+        CB_HALF -->|"tests pass"| CB_CLOSED
+        CB_HALF -->|"tests fail"| CB_OPEN
+    end
+
+    subgraph CHECKPOINT["💾 CHECKPOINT STORE"]
+        direction TB
+        CP_DB["SQLite Store<br/>~/.omp/checkpoints/"]
+        CP1["📝 t=0<br/>Initial state"]
+        CP2["📝 t=1<br/>After tool call 1"]
+        CP3["📝 t=2<br/>After tool call 2"]
+        CP_LATEST["📝 t=N<br/>Latest checkpoint"]
+    end
+
+    subgraph RECOVERY["♻️ RECOVERY OUTCOMES"]
+        direction LR
+        R1["✅ Resume from<br/>checkpoint"]
+        R2["🔀 Route to<br/>alternative specialist"]
+        R3["⚠️ Graceful<br/>degradation<br/>(partial results)"]
+        R4["👤 Human<br/>intervention"]
+    end
+
+    subgraph SAFETY_NETS["🛡️ SAFETY MECHANISMS"]
+        direction TB
+        STUCK["⏱️ STUCK DETECTOR<br/>No tool calls for N sec<br/>→ Trigger escalation"]
+        DEPTH["🔻 DEPTH GUARD<br/>Enforce max_depth<br/>→ Reject spawn if exceeded"]
+        TOKEN["📄 TOKEN GUARD<br/>Global + per-branch<br/>budget enforcement"]
+    end
+
+    F1 --> DETECT
+    F2 --> DETECT
+    F3 --> DETECT
+    F4 --> DETECT
+    F5 --> DETECT
+    F6 --> DETECT
+
+    DETECT -->|transient| L1
+    DETECT -->|wrong approach| L2
+    DETECT -->|too complex| L3
+    DETECT -->|all exhausted| L4
+
+    L1 -->|success| R1
+    L1 -->|fails| L2
+    L2 -->|success| R1
+    L2 -->|fails| L3
+    L3 -->|partial| R3
+    L3 -->|success| R1
+    L4 --> R4
+
+    L1 -.->|"circuit closed"| CB_CLOSED
+    L2 -.->|"circuit open"| CB_OPEN
+
+    CB_OPEN -->|reroute| R2
+    CP_DB -->|restore| R1
+    CP_LATEST -.->|"resume point"| R1
+
+    STUCK -.->|"kill branch"| DETECT
+    DEPTH -.->|"reject"| L3
+    TOKEN -.->|"kill tree"| L4
+
+    style DETECTION fill:#ffebee,stroke:#c62828,stroke-width:2px
+    style F1 fill:#ffcdd2,stroke:#c62828
+    style F2 fill:#ffcdd2,stroke:#c62828
+    style F3 fill:#ffcdd2,stroke:#c62828
+    style F4 fill:#ffcdd2,stroke:#c62828
+    style F5 fill:#ffcdd2,stroke:#c62828
+    style F6 fill:#ffcdd2,stroke:#c62828
+    style DETECT fill:#ef9a9a,stroke:#b71c1c,stroke-width:3px
+
+    style ESCALATION fill:#fff8e1,stroke:#f57f17,stroke-width:2px
+    style L1 fill:#c8e6c9,stroke:#2e7d32,stroke-width:2px
+    style L1_DESC fill:#a5d6a7,stroke:#388e3c
+    style L1_COND fill:#dcedc8,stroke:#558b2f
+    style L2 fill:#fff9c4,stroke:#f9a825,stroke-width:2px
+    style L2_DESC fill:#fff59d,stroke:#f57f17
+    style L2_COND fill:#fff9c4,stroke:#f9a825
+    style L3 fill:#ffe0b2,stroke:#ef6c00,stroke-width:2px
+    style L3_DESC fill:#ffcc80,stroke:#ef6c00
+    style L3_COND fill:#ffe0b2,stroke:#ef6c00
+    style L4 fill:#ffcdd2,stroke:#c62828,stroke-width:2px
+    style L4_DESC fill:#ef9a9a,stroke:#c62828
+    style L4_COND fill:#ffcdd2,stroke:#c62828
+
+    style CIRCUIT fill:#e8eaf6,stroke:#283593,stroke-width:2px
+    style CB_CLOSED fill:#c8e6c9,stroke:#2e7d32
+    style CB_OPEN fill:#ffcdd2,stroke:#c62828
+    style CB_HALF fill:#ffe082,stroke:#ff8f00
+
+    style CHECKPOINT fill:#e0f2f1,stroke:#00695c,stroke-width:2px
+    style CP_DB fill:#b2dfdb,stroke:#00796b
+    style CP1 fill:#80cbc4,stroke:#00695c
+    style CP2 fill:#80cbc4,stroke:#00695c
+    style CP3 fill:#80cbc4,stroke:#00695c
+    style CP_LATEST fill:#4db6ac,stroke:#00695c,stroke-width:2px
+
+    style RECOVERY fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    style R1 fill:#a5d6a7,stroke:#388e3c,stroke-width:2px
+    style R2 fill:#bbdefb,stroke:#1976d2,stroke-width:2px
+    style R3 fill:#ffe082,stroke:#f57f17,stroke-width:2px
+    style R4 fill:#ffcdd2,stroke:#c62828,stroke-width:2px
+
+    style SAFETY_NETS fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px
+    style STUCK fill:#e1bee7,stroke:#8e24aa
+    style DEPTH fill:#e1bee7,stroke:#8e24aa
+    style TOKEN fill:#e1bee7,stroke:#8e24aa

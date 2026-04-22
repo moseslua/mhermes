@@ -53,6 +53,28 @@ Concrete environments inherit from `HermesAgentBaseEnv` and implement:
 - `compute_reward()` -- Score the rollout using ToolContext
 - `evaluate()` -- Periodic evaluation logic
 
+## Verification Ladder for Contributors
+
+Hermes already has heavier agent-eval infrastructure than most repos, but contributors should not jump to the heaviest benchmark by default. Use the smallest proof that can falsify a bad change, then escalate only when the touched surface justifies it.
+
+| Surface touched | Required proof | Optional escalation |
+|---|---|---|
+| Docs / process only | Targeted manual review; no behavior change | None |
+| Planning / review skill changes | Targeted deterministic tests for affected slash / skill paths | Manual skill-path sanity check |
+| Prompt / memory / caching | Targeted regression tests + compatibility checks | TBLite subset |
+| Tool / gateway / TUI contracts | Boundary tests + focused integration checks | TBLite or TB2 subset |
+| Benchmark / environment code | Benchmark-specific validation notes + targeted harness checks | Full benchmark run |
+
+Recommended escalation path:
+
+1. **Targeted deterministic regression tests** — default for most changes
+2. **Focused integration / boundary checks** — when a change crosses module or protocol boundaries
+3. **TBLite subset** — when prompt/tool/agent-loop behavior may shift
+4. **TB2 subset/full** — for terminal-agent behavior or benchmark-facing claims
+5. **YC-Bench** — for long-horizon planning / strategy changes only
+
+This keeps normal contributor workflow fast while preserving a clear path to deeper agent evaluation when it matters.
+
 ## Core Components
 
 ### Agent Loop (`agent_loop.py`)

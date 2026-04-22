@@ -40,7 +40,7 @@ Read the plan file. Extract ALL tasks with their full text and context upfront. 
 
 ```python
 # Read the plan
-read_file("docs/plans/feature-plan.md")
+read_file(".hermes/plans/feature-plan.md")
 
 # Create todo list with all tasks
 todo([
@@ -72,10 +72,10 @@ delegate_task(
 
     FOLLOW TDD:
     1. Write failing test in tests/models/test_user.py
-    2. Run: pytest tests/models/test_user.py -v (verify FAIL)
+    2. Run: <project test command for this case> (verify FAIL)
     3. Write minimal implementation
-    4. Run: pytest tests/models/test_user.py -v (verify PASS)
-    5. Run: pytest tests/ -q (verify no regressions)
+    4. Run: <project test command for this case> (verify PASS)
+    5. Run: <project broader regression command> (verify no regressions)
     6. Commit: git add -A && git commit -m "feat: add User model with password hashing"
 
     PROJECT CONTEXT:
@@ -176,8 +176,8 @@ delegate_task(
 ### 4. Verify and Commit
 
 ```bash
-# Run full test suite
-pytest tests/ -q
+# Run the project's broader regression command
+<project broader regression command>
 
 # Review all changes
 git diff --stat
@@ -284,7 +284,7 @@ If a subagent encounters bugs during implementation:
 ## Example Workflow
 
 ```
-[Read plan: docs/plans/auth-feature.md]
+[Read plan: .hermes/plans/auth-feature.md]
 [Create todo list with 5 tasks]
 
 --- Task 1: Create User model ---

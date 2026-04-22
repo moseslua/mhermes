@@ -46,8 +46,8 @@ _HERMES_CORE_TOOLS = [
     "browser_vision", "browser_console", "browser_cdp",
     # Text-to-speech
     "text_to_speech",
-    # Planning & memory
-    "todo", "memory",
+    # Planning, mission control, memory, and OSS contribution
+    "todo", "mission", "memory", "oss_contribution",
     # Session history search
     "session_search",
     # Clarifying questions
@@ -162,6 +162,12 @@ TOOLSETS = {
         "includes": []
     },
     
+    "mission": {
+        "description": "Canonical mission, handoff, and checkpoint management",
+        "tools": ["mission"],
+        "includes": []
+    },
+    
     "memory": {
         "description": "Persistent memory across sessions (personal notes + user profile)",
         "tools": ["memory"],
@@ -250,7 +256,7 @@ TOOLSETS = {
             "browser_type", "browser_scroll", "browser_back",
             "browser_press", "browser_get_images",
             "browser_vision", "browser_console", "browser_cdp",
-            "todo", "memory",
+            "todo", "mission", "memory", "oss_contribution",
             "session_search",
             "execute_code", "delegate_task",
         ],
@@ -275,8 +281,8 @@ TOOLSETS = {
             "browser_type", "browser_scroll", "browser_back",
             "browser_press", "browser_get_images",
             "browser_vision", "browser_console", "browser_cdp",
-            # Planning & memory
-            "todo", "memory",
+            # Planning, mission control, and memory
+            "todo", "mission", "memory", "oss_contribution",
             # Session history search
             "session_search",
             # Code execution + delegation

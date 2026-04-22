@@ -14,11 +14,11 @@ metadata:
 
 ## Overview
 
-Write comprehensive implementation plans assuming the implementer has zero context for the codebase and questionable taste. Document everything they need: which files to touch, complete code, testing commands, docs to check, how to verify. Give them bite-sized tasks. DRY. YAGNI. TDD. Frequent commits.
+Write comprehensive implementation plans assuming the implementer has little context for the codebase and needs explicit verification guidance. Document what they need to touch, why the change is scoped the way it is, which interfaces must remain stable, how to verify the change, and which risks matter. Give them bite-sized tasks. DRY. YAGNI. TDD. Evidence first.
 
-Assume the implementer is a skilled developer but knows almost nothing about the toolset or problem domain. Assume they don't know good test design very well.
+Assume the implementer is a skilled developer but may not understand the repo's hidden invariants, interface boundaries, or the right level of test rigor without help.
 
-**Core principle:** A good plan makes implementation obvious. If someone has to guess, the plan is incomplete.
+**Core principle:** A good plan makes implementation and verification obvious. If someone has to guess about scope, contracts, or proof, the plan is incomplete.
 
 ## When to Use
 
@@ -34,14 +34,9 @@ Assume the implementer is a skilled developer but knows almost nothing about the
 
 ## Bite-Sized Task Granularity
 
-**Each task = 2-5 minutes of focused work.**
+Each task should be small enough to verify independently and large enough to matter. Aim for one coherent change slice per task, not a fixed time budget.
 
-Every step is one action:
-- "Write the failing test" — step
-- "Run it to make sure it fails" — step
-- "Implement the minimal code to make the test pass" — step
-- "Run the tests and make sure they pass" — step
-- "Commit" — step
+Every task should answer one question clearly: what gets added, changed, or verified in this step?
 
 **Too big:**
 ```markdown
@@ -51,16 +46,17 @@ Every step is one action:
 
 **Right size:**
 ```markdown
-### Task 1: Create User model with email field
-[10 lines, 1 file]
+### Task 1: Add the failing regression test for empty passwords
+[1 file, 1 behavior]
 
-### Task 2: Add password hash field to User
-[8 lines, 1 file]
+### Task 2: Update the auth validator to reject empty and null passwords
+[1-2 files, same contract]
 
-### Task 3: Create password hashing utility
-[15 lines, 1 file]
+### Task 3: Add boundary tests for the CLI/auth integration path
+[1-2 files, integration proof]
 ```
 
+Prefer grouping work by behavior boundary, not by arbitrary minute counts or commit cadence.
 ## Plan Document Structure
 
 ### Header (Required)
@@ -81,6 +77,25 @@ Every plan MUST start with:
 ---
 ```
 
+### Contract block (Required for non-trivial code changes)
+
+Every substantial plan should include a dedicated contract/evidence block near the top:
+
+```markdown
+## Contract and Evidence
+- In scope:
+- Out of scope:
+- Stable interfaces touched:
+- Acceptance criteria:
+- Deterministic tests:
+- Edge cases / degraded mode:
+- Data integrity assumptions:
+- Rollout / rollback:
+- Eval tier: none | targeted tests | focused integration checks | repo-specific benchmark/eval, if any
+```
+
+This is more important than including large code dumps. Prefer exact file paths, verification steps, and risk notes over speculative implementation detail.
+
 ### Task Structure
 
 Each task follows this format:
@@ -91,41 +106,30 @@ Each task follows this format:
 **Objective:** What this task accomplishes (one sentence)
 
 **Files:**
-- Create: `exact/path/to/new_file.py`
-- Modify: `exact/path/to/existing.py:45-67` (line numbers if known)
-- Test: `tests/path/to/test_file.py`
+- Create: `exact/path/to/new_file.ext`
+- Modify: `exact/path/to/existing.ext:Lx-Ly`
+- Verify: `tests/or/checks/that/prove/this`
 
-**Step 1: Write failing test**
+**Acceptance criteria:**
+- Observable outcome 1
+- Observable outcome 2
 
-```python
-def test_specific_behavior():
-    result = function(input)
-    assert result == expected
-```
+**Step 1: Add or update the verification first**
 
-**Step 2: Run test to verify failure**
+Describe the deterministic test, assertion, or check that should fail before the change.
 
-Run: `pytest tests/path/test.py::test_specific_behavior -v`
-Expected: FAIL — "function not defined"
+**Step 2: Make the minimal implementation change**
 
-**Step 3: Write minimal implementation**
+Describe the smallest code/config/doc change that satisfies the contract.
 
-```python
-def function(input):
-    return expected
-```
+**Step 3: Re-run verification**
 
-**Step 4: Run test to verify pass**
+Run: `<project test command or verification step>`
+Expected: PASS / expected output / expected observable behavior
 
-Run: `pytest tests/path/test.py::test_specific_behavior -v`
-Expected: PASS
+**Step 4: Note boundary or rollback concerns**
 
-**Step 5: Commit**
-
-```bash
-git add tests/path/test.py src/path/file.py
-git commit -m "feat: add specific feature"
-```
+Call out compatibility, degraded-mode behavior, or rollback notes when relevant.
 ````
 
 ## Writing Process
@@ -142,18 +146,18 @@ Read and understand:
 
 Use Hermes tools to understand the project:
 
-```python
+```text
 # Understand project structure
-search_files("*.py", target="files", path="src/")
+search_files("*", target="files", path="src/")
 
 # Look at similar features
-search_files("similar_pattern", path="src/", file_glob="*.py")
+search_files("similar_pattern", path="src/")
 
-# Check existing tests
-search_files("*.py", target="files", path="tests/")
+# Check existing tests or verification surfaces
+search_files("test_", target="files", path="tests/")
 
 # Read key files
-read_file("src/app.py")
+read_file("path/to/key/file")
 ```
 
 ### Step 3: Design Approach
@@ -177,29 +181,37 @@ Create tasks in order:
 
 For each task, include:
 - **Exact file paths** (not "the config file" but `src/config/settings.py`)
-- **Complete code examples** (not "add validation" but the actual code)
-- **Exact commands** with expected output
-- **Verification steps** that prove the task works
+- **Acceptance criteria** that a reviewer can check
+- **Exact commands** with expected output when verification is straightforward
+- **Deterministic tests and integration checks** that prove the changed behavior
+- **Edge cases / degraded-mode expectations** when the task crosses a boundary or touches error handling
+- **Interface or compatibility notes** when old callers or external consumers might break
 
 ### Step 6: Review the Plan
 
 Check:
 - [ ] Tasks are sequential and logical
-- [ ] Each task is bite-sized (2-5 min)
 - [ ] File paths are exact
-- [ ] Code examples are complete (copy-pasteable)
-- [ ] Commands are exact with expected output
+- [ ] Acceptance criteria are testable
+- [ ] Verification steps prove the claimed behavior
+- [ ] Edge cases and degraded modes are called out where relevant
+- [ ] Stable interfaces / compatibility boundaries are named
 - [ ] No missing context
 - [ ] DRY, YAGNI, TDD principles applied
 
 ### Step 7: Save the Plan
 
+Use the workspace plan path that matches the request:
+
 ```bash
+# Default working plan artifact
+mkdir -p .hermes/plans
+
+# Shared repo documentation only when the plan itself is meant to land in version control
 mkdir -p docs/plans
-# Save plan to docs/plans/YYYY-MM-DD-feature-name.md
-git add docs/plans/
-git commit -m "docs: add implementation plan for [feature]"
 ```
+
+Prefer `.hermes/plans/` for normal execution handoffs. Use `docs/plans/` only when the user explicitly wants the plan committed as project documentation.
 
 ## Principles
 
@@ -239,13 +251,11 @@ Every task that produces code should include the full TDD cycle:
 
 See `test-driven-development` skill for details.
 
-### Frequent Commits
+### Commit Strategy
 
-Commit after every task:
-```bash
-git add [files]
-git commit -m "type: description"
-```
+Commit at natural reviewable boundaries when the plan is intended for execution. Do not force a commit after every tiny step if it would create noise or split one behavior change across multiple commits.
+
+Use commit guidance to improve reversibility, not to satisfy a rigid cadence.
 
 ## Common Mistakes
 
@@ -254,15 +264,15 @@ git commit -m "type: description"
 **Bad:** "Add authentication"
 **Good:** "Create User model with email and password_hash fields"
 
-### Incomplete Code
+### Missing Contract Detail
 
-**Bad:** "Step 1: Add validation function"
-**Good:** "Step 1: Add validation function" followed by the complete function code
+**Bad:** "Step 1: Add validation"
+**Good:** "Step 1: Add validation for empty and malformed inputs in `src/auth/validator.ext`, and verify it fails before the implementation change"
 
 ### Missing Verification
 
 **Bad:** "Step 3: Test it works"
-**Good:** "Step 3: Run `pytest tests/test_auth.py -v`, expected: 3 passed"
+**Good:** "Step 3: Run the project's canonical test or verification command and record the expected passing outcome"
 
 ### Missing File Paths
 
@@ -284,13 +294,13 @@ When executing, use the `subagent-driven-development` skill:
 ## Remember
 
 ```
-Bite-sized tasks (2-5 min each)
+Behavior-scoped tasks
 Exact file paths
-Complete code (copy-pasteable)
-Exact commands with expected output
-Verification steps
+Acceptance criteria
+Deterministic verification
+Edge cases and degraded-mode expectations
+Interface / compatibility notes
 DRY, YAGNI, TDD
-Frequent commits
 ```
 
 **A good plan makes implementation obvious.**

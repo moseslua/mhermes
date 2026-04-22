@@ -22,7 +22,6 @@ import logging
 import re
 from typing import Dict, Any, List, Optional, Union
 
-from agent.auxiliary_client import async_call_llm, extract_content_or_reasoning
 MAX_SESSION_CHARS = 100_000
 MAX_SUMMARY_TOKENS = 10000
 
@@ -172,6 +171,20 @@ def _truncate_around_matches(
     return prefix + truncated + suffix
 
 
+async def _call_session_search_llm(system_prompt: str, user_prompt: str) -> Optional[str]:
+    from agent.auxiliary_client import async_call_llm, extract_content_or_reasoning
+    response = await async_call_llm(
+        task="session_search",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0.1,
+        max_tokens=MAX_SUMMARY_TOKENS,
+    )
+    return extract_content_or_reasoning(response)
+
+
 async def _summarize_session(
     conversation_text: str, query: str, session_meta: Dict[str, Any]
 ) -> Optional[str]:
@@ -189,7 +202,7 @@ async def _summarize_session(
     )
 
     source = session_meta.get("source", "unknown")
-    started = _format_timestamp(session_meta.get("started_at"))
+    started = _format_timestamp(session_meta.get("started_at") or session_meta.get("session_started"))
 
     user_prompt = (
         f"Search topic: {query}\n"
@@ -202,16 +215,7 @@ async def _summarize_session(
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            response = await async_call_llm(
-                task="session_search",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=0.1,
-                max_tokens=MAX_SUMMARY_TOKENS,
-            )
-            content = extract_content_or_reasoning(response)
+            content = await _call_session_search_llm(system_prompt, user_prompt)
             if content:
                 return content
             # Reasoning-only / empty — let the retry loop handle it
@@ -242,46 +246,256 @@ async def _summarize_session(
 _HIDDEN_SESSION_SOURCES = ("tool",)
 
 
-def _list_recent_sessions(db, limit: int, current_session_id: str = None) -> str:
+def _coerce_limit(limit: Any, default: int = 3) -> int:
+    """Coerce model-provided limits into the supported integer range."""
+    if not isinstance(limit, int):
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            limit = default
+    return max(1, min(limit, 5))
+
+
+def _parse_role_filter(role_filter: Optional[str]) -> Optional[List[str]]:
+    """Parse a comma-delimited role filter into a normalized list."""
+    if not role_filter or not role_filter.strip():
+        return None
+    return [role.strip() for role in role_filter.split(",") if role.strip()]
+
+
+def _activity_sort_key(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float("-inf")
+
+
+def _latest_message_preview(db, session_id: str) -> str:
+    try:
+        messages = db.get_messages(session_id)
+    except Exception:
+        return ""
+    for message in reversed(messages):
+        content = str(message.get("content") or "").strip()
+        if content:
+            preview = content[:60]
+            return preview + ("..." if len(content) > 60 else "")
+    return ""
+
+
+def _resolve_lineage_root(db, session_id: Optional[str]) -> Optional[str]:
+    """Walk parent pointers until the root session is reached."""
+    if not session_id:
+        return None
+
+    visited = set()
+    sid = session_id
+    resolved_sid = session_id
+    while sid and sid not in visited:
+        visited.add(sid)
+        resolved_sid = sid
+        try:
+            session = db.get_session(sid)
+        except Exception as e:
+            logging.debug(
+                "Error resolving parent for session %s: %s",
+                sid,
+                e,
+                exc_info=True,
+            )
+            break
+
+        if not session:
+            break
+
+        parent_session_id = session.get("parent_session_id")
+        if not parent_session_id:
+            break
+        sid = parent_session_id
+
+    return resolved_sid
+
+
+def list_recent_history_records(
+    db,
+    limit: int,
+    current_session_id: str = None,
+    user_id: str = None,
+    source: str = None,
+) -> List[Dict[str, Any]]:
+    """Return structured canonical metadata for recent visible root sessions."""
+    limit = _coerce_limit(limit)
+    current_lineage_root = _resolve_lineage_root(db, current_session_id)
+    batch_size = max(200, limit * 20)
+    offset = 0
+    lineages: dict[str, dict[str, Any]] = {}
+    while True:
+        sessions = db.list_sessions_rich(
+            source=source,
+            limit=batch_size,
+            offset=offset,
+            exclude_sources=list(_HIDDEN_SESSION_SOURCES),
+            include_children=True,
+            user_id=user_id,
+        )
+        if not sessions:
+            break
+        for session in sessions:
+            raw_session_id = session.get("id", "")
+            resolved_session_id = _resolve_lineage_root(db, raw_session_id) or raw_session_id
+            if current_lineage_root and resolved_session_id == current_lineage_root:
+                continue
+            if current_session_id and raw_session_id == current_session_id:
+                continue
+            if resolved_session_id not in lineages:
+                root_session = session if raw_session_id == resolved_session_id else (db.get_session(resolved_session_id) or {})
+                lineages[resolved_session_id] = {
+                    "session_id": resolved_session_id,
+                    "title": root_session.get("title") or None,
+                    "source": root_session.get("source") or session.get("source", ""),
+                    "started_at": root_session.get("started_at", ""),
+                    "last_active": session.get("last_active", ""),
+                    "message_count": 0,
+                    "preview": _latest_message_preview(db, raw_session_id) or session.get("preview", ""),
+                }
+            lineage = lineages[resolved_session_id]
+            lineage["message_count"] += int(session.get("message_count") or 0)
+            if _activity_sort_key(session.get("last_active")) >= _activity_sort_key(lineage.get("last_active")):
+                lineage["last_active"] = session.get("last_active", "")
+                lineage["preview"] = _latest_message_preview(db, raw_session_id) or session.get("preview", "")
+        if len(sessions) < batch_size:
+            break
+        offset += batch_size
+    results = sorted(
+        lineages.values(),
+        key=lambda record: (
+            _activity_sort_key(record.get("last_active")),
+            _activity_sort_key(record.get("started_at")),
+        ),
+        reverse=True,
+    )[:limit]
+    return results
+
+
+def search_history_records(
+    query: str,
+    role_filter: str = None,
+    limit: int = 3,
+    db=None,
+    current_session_id: str = None,
+    user_id: str = None,
+    source: str = None,
+) -> Dict[str, Any]:
+    """Return structured canonical search hits without LLM summarization."""
+    normalized_query = (query or "").strip()
+    limit = _coerce_limit(limit)
+    role_list = _parse_role_filter(role_filter)
+    current_lineage_root = _resolve_lineage_root(db, current_session_id)
+    seen_sessions: Dict[str, Dict[str, Any]] = {}
+    raw_match_count = 0
+    batch_size = max(200, limit * 20)
+    offset = 0
+    while len(seen_sessions) < limit:
+        raw_results = db.search_messages(
+            query=normalized_query,
+            source_filter=[source] if source else None,
+            role_filter=role_list,
+            exclude_sources=list(_HIDDEN_SESSION_SOURCES),
+            limit=batch_size,
+            offset=offset,
+            user_id=user_id,
+        )
+        if not raw_results:
+            break
+        for result in raw_results:
+            raw_session_id = result["session_id"]
+            resolved_session_id = _resolve_lineage_root(db, raw_session_id) or raw_session_id
+            if current_lineage_root and resolved_session_id == current_lineage_root:
+                continue
+            if current_session_id and raw_session_id == current_session_id:
+                continue
+            if resolved_session_id not in seen_sessions:
+                if len(seen_sessions) >= limit:
+                    continue
+                seen_sessions[resolved_session_id] = {
+                    "session_id": resolved_session_id,
+                    "title": None,
+                    "when": _format_timestamp(result.get("session_started")),
+                    "source": result.get("source", "unknown"),
+                    "model": result.get("model"),
+                    "session_started": result.get("session_started"),
+                    "started_at": result.get("session_started"),
+                    "matched_session_ids": [],
+                    "matched_session_started_at": {},
+                }
+            record = seen_sessions[resolved_session_id]
+            if raw_session_id not in record["matched_session_ids"]:
+                record["matched_session_ids"].append(raw_session_id)
+            record["matched_session_started_at"][raw_session_id] = result.get("session_started")
+            record = seen_sessions[resolved_session_id]
+            if raw_session_id not in record["matched_session_ids"]:
+                record["matched_session_ids"].append(raw_session_id)
+            raw_match_count += 1
+        if len(raw_results) < batch_size:
+            break
+        offset += batch_size
+
+    records = []
+    for session_id, record in seen_sessions.items():
+        try:
+            session_meta = db.get_session(session_id) or {}
+            messages = []
+            matched_ids = record.pop("matched_session_ids")
+            matched_started_at = record.pop("matched_session_started_at")
+            ordered_ids = sorted(
+                matched_ids or [session_id],
+                key=lambda matched_session_id: (
+                    matched_started_at.get(matched_session_id)
+                    or (db.get_session(matched_session_id) or {}).get("started_at")
+                    or 0
+                ),
+            )
+            for matched_session_id in ordered_ids:
+                messages.extend(db.get_messages_as_conversation(matched_session_id) or [])
+            if not messages:
+                continue
+            record["title"] = session_meta.get("title") or None
+            record["source"] = session_meta.get("source") or record["source"]
+            record["started_at"] = session_meta.get("started_at") or record.get("started_at")
+            record["messages"] = messages
+            records.append(record)
+        except Exception as e:
+            logging.warning(
+                "Failed to prepare session %s: %s",
+                session_id,
+                e,
+                exc_info=True,
+            )
+
+    return {
+        "query": normalized_query,
+        "results": records,
+        "count": len(records),
+        "sessions_searched": len(seen_sessions),
+    }
+
+
+def _list_recent_sessions(
+    db,
+    limit: int,
+    current_session_id: str = None,
+    user_id: str = None,
+    source: str = None,
+) -> str:
     """Return metadata for the most recent sessions (no LLM calls)."""
     try:
-        sessions = db.list_sessions_rich(limit=limit + 5, exclude_sources=list(_HIDDEN_SESSION_SOURCES))  # fetch extra to skip current
-
-        # Resolve current session lineage to exclude it
-        current_root = None
-        if current_session_id:
-            try:
-                sid = current_session_id
-                visited = set()
-                while sid and sid not in visited:
-                    visited.add(sid)
-                    s = db.get_session(sid)
-                    parent = s.get("parent_session_id") if s else None
-                    sid = parent if parent else None
-                current_root = max(visited, key=len) if visited else current_session_id
-            except Exception:
-                current_root = current_session_id
-
-        results = []
-        for s in sessions:
-            sid = s.get("id", "")
-            if current_root and (sid == current_root or sid == current_session_id):
-                continue
-            # Skip child/delegation sessions (they have parent_session_id)
-            if s.get("parent_session_id"):
-                continue
-            results.append({
-                "session_id": sid,
-                "title": s.get("title") or None,
-                "source": s.get("source", ""),
-                "started_at": s.get("started_at", ""),
-                "last_active": s.get("last_active", ""),
-                "message_count": s.get("message_count", 0),
-                "preview": s.get("preview", ""),
-            })
-            if len(results) >= limit:
-                break
-
+        results = list_recent_history_records(
+            db,
+            limit=limit,
+            current_session_id=current_session_id,
+            user_id=user_id,
+            source=source,
+        )
         return json.dumps({
             "success": True,
             "mode": "recent",
@@ -300,6 +514,8 @@ def session_search(
     limit: int = 3,
     db=None,
     current_session_id: str = None,
+    user_id: str = None,
+    source: str = None,
 ) -> str:
     """
     Search past sessions and return focused summaries of matching conversations.
@@ -310,123 +526,49 @@ def session_search(
     if db is None:
         return tool_error("Session database not available.", success=False)
 
-    # Defensive: models (especially open-source) may send non-int limit values
-    # (None when JSON null, string "int", or even a type object).  Coerce to a
-    # safe integer before any arithmetic/comparison to prevent TypeError.
-    if not isinstance(limit, int):
-        try:
-            limit = int(limit)
-        except (TypeError, ValueError):
-            limit = 3
-    limit = max(1, min(limit, 5))  # Clamp to [1, 5]
+    limit = _coerce_limit(limit)
 
     # Recent sessions mode: when query is empty, return metadata for recent sessions.
     # No LLM calls — just DB queries for titles, previews, timestamps.
     if not query or not query.strip():
-        return _list_recent_sessions(db, limit, current_session_id)
+        return _list_recent_sessions(db, limit, current_session_id, user_id, source)
 
     query = query.strip()
 
     try:
-        # Parse role filter
-        role_list = None
-        if role_filter and role_filter.strip():
-            role_list = [r.strip() for r in role_filter.split(",") if r.strip()]
-
-        # FTS5 search -- get matches ranked by relevance
-        raw_results = db.search_messages(
+        search_result = search_history_records(
             query=query,
-            role_filter=role_list,
-            exclude_sources=list(_HIDDEN_SESSION_SOURCES),
-            limit=50,  # Get more matches to find unique sessions
-            offset=0,
+            role_filter=role_filter,
+            limit=limit,
+            db=db,
+            current_session_id=current_session_id,
+            user_id=user_id,
+            source=source,
         )
 
-        if not raw_results:
+        if not search_result["results"]:
             return json.dumps({
                 "success": True,
                 "query": query,
                 "results": [],
                 "count": 0,
+                "sessions_searched": search_result["sessions_searched"],
                 "message": "No matching sessions found.",
             }, ensure_ascii=False)
 
-        # Resolve child sessions to their parent — delegation stores detailed
-        # content in child sessions, but the user's conversation is the parent.
-        def _resolve_to_parent(session_id: str) -> str:
-            """Walk delegation chain to find the root parent session ID."""
-            visited = set()
-            sid = session_id
-            while sid and sid not in visited:
-                visited.add(sid)
-                try:
-                    session = db.get_session(sid)
-                    if not session:
-                        break
-                    parent = session.get("parent_session_id")
-                    if parent:
-                        sid = parent
-                    else:
-                        break
-                except Exception as e:
-                    logging.debug(
-                        "Error resolving parent for session %s: %s",
-                        sid,
-                        e,
-                        exc_info=True,
-                    )
-                    break
-            return sid
-
-        current_lineage_root = (
-            _resolve_to_parent(current_session_id) if current_session_id else None
-        )
-
-        # Group by resolved (parent) session_id, dedup, skip the current
-        # session lineage. Compression and delegation create child sessions
-        # that still belong to the same active conversation.
-        seen_sessions = {}
-        for result in raw_results:
-            raw_sid = result["session_id"]
-            resolved_sid = _resolve_to_parent(raw_sid)
-            # Skip the current session lineage — the agent already has that
-            # context, even if older turns live in parent fragments.
-            if current_lineage_root and resolved_sid == current_lineage_root:
-                continue
-            if current_session_id and raw_sid == current_session_id:
-                continue
-            if resolved_sid not in seen_sessions:
-                result = dict(result)
-                result["session_id"] = resolved_sid
-                seen_sessions[resolved_sid] = result
-            if len(seen_sessions) >= limit:
-                break
-
-        # Prepare all sessions for parallel summarization
         tasks = []
-        for session_id, match_info in seen_sessions.items():
-            try:
-                messages = db.get_messages_as_conversation(session_id)
-                if not messages:
-                    continue
-                session_meta = db.get_session(session_id) or {}
-                conversation_text = _format_conversation(messages)
-                conversation_text = _truncate_around_matches(conversation_text, query)
-                tasks.append((session_id, match_info, conversation_text, session_meta))
-            except Exception as e:
-                logging.warning(
-                    "Failed to prepare session %s: %s",
-                    session_id,
-                    e,
-                    exc_info=True,
-                )
+        for record in search_result["results"]:
+            conversation_text = _truncate_around_matches(
+                _format_conversation(record["messages"]),
+                query,
+            )
+            tasks.append((record, conversation_text))
 
-        # Summarize all sessions in parallel
         async def _summarize_all() -> List[Union[str, Exception]]:
             """Summarize all sessions in parallel."""
             coros = [
-                _summarize_session(text, query, meta)
-                for _, _, text, meta in tasks
+                _summarize_session(conversation_text, query, record)
+                for record, conversation_text in tasks
             ]
             return await asyncio.gather(*coros, return_exceptions=True)
 
@@ -450,7 +592,8 @@ def session_search(
             }, ensure_ascii=False)
 
         summaries = []
-        for (session_id, match_info, conversation_text, _), result in zip(tasks, results):
+        for (record, conversation_text), result in zip(tasks, results):
+            session_id = record["session_id"]
             if isinstance(result, Exception):
                 logging.warning(
                     "Failed to summarize session %s: %s",
@@ -460,16 +603,14 @@ def session_search(
 
             entry = {
                 "session_id": session_id,
-                "when": _format_timestamp(match_info.get("session_started")),
-                "source": match_info.get("source", "unknown"),
-                "model": match_info.get("model"),
+                "when": record["when"],
+                "source": record["source"],
+                "model": record["model"],
             }
 
             if result:
                 entry["summary"] = result
             else:
-                # Fallback: raw preview so matched sessions aren't silently
-                # dropped when the summarizer is unavailable (fixes #3409).
                 preview = (conversation_text[:500] + "\n…[truncated]") if conversation_text else "No preview available."
                 entry["summary"] = f"[Raw preview — summarization unavailable]\n{preview}"
 
@@ -480,7 +621,7 @@ def session_search(
             "query": query,
             "results": summaries,
             "count": len(summaries),
-            "sessions_searched": len(seen_sessions),
+            "sessions_searched": search_result["sessions_searched"],
         }, ensure_ascii=False)
 
     except Exception as e:
@@ -556,7 +697,10 @@ registry.register(
         role_filter=args.get("role_filter"),
         limit=args.get("limit", 3),
         db=kw.get("db"),
-        current_session_id=kw.get("current_session_id")),
+        current_session_id=kw.get("current_session_id"),
+        user_id=kw.get("user_id"),
+        source=kw.get("source"),
+    ),
     check_fn=check_session_search_requirements,
     emoji="🔍",
 )

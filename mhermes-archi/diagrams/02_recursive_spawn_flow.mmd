@@ -1,0 +1,138 @@
+%% HMAOM Recursive Subagent Spawning Protocol
+%% Hierarchical spawn control with budget enforcement
+
+graph TB
+    subgraph CONSTRAINTS["🔒 GLOBAL BUDGET - Root Request"]
+        direction LR
+        B1["⏱️ 5 min wall time"]
+        B2["📄 100K token budget"]
+        B3["💰 $2.00 cost cap"]
+        B4["🔻 Max Depth: 3"]
+        B5["🔀 Max Breadth: 10"]
+    end
+
+    subgraph TREE["🌲 SPAWN TREE"]
+        direction TB
+
+        L0["🔷 Level 0: Gateway Router<br/>spawn depth=3 budget=100K<br/>correlationId: req-abc-123"]
+
+        subgraph L1["Level 1 — Finance Specialist"]
+            L1_NODE["💰 Finance Harness<br/>depth=1 budget=30K tokens"]
+
+            subgraph L1_AGENTS["Subagents"]
+                L1_A1["⚙️ explore-agent<br/>depth=2 budget=10K"]
+                L1_A2["⚙️ calculate-agent<br/>depth=2 budget=10K"]
+                L1_A3["⚙️ verify-agent<br/>no-spawn sequential"]
+            end
+        end
+
+        subgraph L2["Level 2 — Explore Subagent"]
+            L2_NODE["⚙️ explore-agent<br/>depth=2 budget=10K tokens"]
+
+            subgraph L2_AGENTS["Subagents"]
+                L2_A1["⚙️ data-extraction<br/>depth=1 budget=5K"]
+                L2_A2["⚙️ analysis-agent<br/>depth=1 budget=3K"]
+            end
+        end
+
+        subgraph L3["Level 3 — Leaf Agents"]
+            direction LR
+            L3_A1["🍃 data-extraction-leaf<br/>depth=3 MAX DEPTH<br/>NO FURTHER SPAWNING<br/>output: extracted_data"]
+            L3_A2["🍃 analysis-leaf<br/>depth=3 MAX DEPTH<br/>NO FURTHER SPAWNING<br/>output: analysis_result"]
+            L3_A3["🍃 calc-leaf<br/>depth=3 MAX DEPTH<br/>NO FURTHER SPAWNING<br/>output: calc_result"]
+        end
+
+        subgraph AGGREGATION["📦 Result Aggregation"]
+            AGG["🔄 Aggregate Results<br/>Tree Reduce Operation<br/>Tokens used: 2K / 5K"]
+        end
+    end
+
+    subgraph SYNTH["📝 SYNTHESIS"]
+        SYNTH_NODE["Reporter Harness<br/>Synthesize cross-domain results<br/>schema: StructuredReport"]
+    end
+
+    subgraph BUDGET_TRACKER["📊 REAL-TIME BUDGET TRACKER"]
+        direction TB
+        BT_GLOBAL["Global: 100K tokens, $2.00, 5 min<br/>Used: 47K tokens, $0.89, 2.1 min<br/>Status: UNDER BUDGET"]
+        BT_BRANCH1["Finance branch: 30K allocated<br/>Used: 18K, Remaining: 12K"]
+        BT_BRANCH2["Explore branch: 10K allocated<br/>Used: 7K, Remaining: 3K"]
+        BT_LEAF["Leaf: 5K allocated<br/>Used: 2K, Returned: 3K"]
+    end
+
+    subgraph SAFETY["🛡️ SAFETY MECHANISMS"]
+        direction LR
+        STUCK["Stuck Detector<br/>No tool calls > 30s - Kill"]
+        CB["Circuit Breaker<br/>5 failures - Open - Reroute"]
+        CP["Checkpoint Store<br/>Restore on failure"]
+    end
+
+    L0 --> L1_NODE
+    L1_NODE --> L1_A1
+    L1_NODE --> L1_A2
+    L1_NODE --> L1_A3
+
+    L1_A1 --> L2_NODE
+    L2_NODE --> L2_A1
+    L2_NODE --> L2_A2
+
+    L2_A1 --> L3_A1
+    L2_A2 --> L3_A2
+    L1_A2 --> L3_A3
+
+    L3_A1 --> AGG
+    L3_A2 --> AGG
+    L3_A3 --> AGG
+
+    AGG --> SYNTH_NODE
+
+    B1 -.-> L0
+    B2 -.-> TREE
+    B3 -.-> TREE
+    B4 -.-> L3_A1
+    B5 -.-> L1_AGENTS
+
+    BT_GLOBAL -.-> L0
+    BT_BRANCH1 -.-> L1_NODE
+    BT_BRANCH2 -.-> L2_NODE
+    BT_LEAF -.-> L3_A1
+
+    STUCK -.-> L2_NODE
+    CB -.-> L1_NODE
+    CP -.-> L2_A1
+
+    style CONSTRAINTS fill:#ffebee,stroke:#c62828,stroke-width:2px
+    style B1 fill:#ffcdd2,stroke:#c62828
+    style B2 fill:#ffcdd2,stroke:#c62828
+    style B3 fill:#ffcdd2,stroke:#c62828
+    style B4 fill:#ffcdd2,stroke:#c62828
+    style B5 fill:#ffcdd2,stroke:#c62828
+    style TREE fill:#e3f2fd,stroke:#1565c0,stroke-width:2px
+    style L0 fill:#fff3e0,stroke:#e65100,stroke-width:3px
+    style L1 fill:#fce4ec,stroke:#c62828
+    style L1_NODE fill:#f8bbd9,stroke:#c62828
+    style L1_AGENTS fill:#fce4ec,stroke:#ad1457
+    style L1_A1 fill:#f48fb1,stroke:#ad1457
+    style L1_A2 fill:#f48fb1,stroke:#ad1457
+    style L1_A3 fill:#f48fb1,stroke:#ad1457
+    style L2 fill:#ede7f6,stroke:#6a1b9a
+    style L2_NODE fill:#d1c4e9,stroke:#6a1b9a
+    style L2_AGENTS fill:#ede7f6,stroke:#7b1fa2
+    style L2_A1 fill:#b39ddb,stroke:#7b1fa2
+    style L2_A2 fill:#b39ddb,stroke:#7b1fa2
+    style L3 fill:#c8e6c9,stroke:#2e7d32,stroke-width:2px
+    style L3_A1 fill:#a5d6a7,stroke:#388e3c
+    style L3_A2 fill:#a5d6a7,stroke:#388e3c
+    style L3_A3 fill:#a5d6a7,stroke:#388e3c
+    style AGGREGATION fill:#fff9c4,stroke:#f9a825
+    style AGG fill:#fff59d,stroke:#f57f17,stroke-width:2px
+    style SYNTH fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    style SYNTH_NODE fill:#c8e6c9,stroke:#2e7d32
+    style BUDGET_TRACKER fill:#f1f8e9,stroke:#558b2f,stroke-width:2px
+    style BT_GLOBAL fill:#dcedc8,stroke:#558b2f
+    style BT_BRANCH1 fill:#f1f8e9,stroke:#7cb342
+    style BT_BRANCH2 fill:#f1f8e9,stroke:#7cb342
+    style BT_LEAF fill:#f1f8e9,stroke:#7cb342
+    style SAFETY fill:#eceff1,stroke:#455a64,stroke-width:2px
+    style STUCK fill:#cfd8dc,stroke:#546e7a
+    style CB fill:#cfd8dc,stroke:#546e7a
+    style CP fill:#cfd8dc,stroke:#546e7a

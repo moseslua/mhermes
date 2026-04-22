@@ -7,12 +7,15 @@ from unittest.mock import patch
 
 import tools.skills_tool as skills_tool_module
 from agent.skill_commands import (
+    build_mission_command_message,
     build_plan_path,
     build_preloaded_skills_prompt,
     build_skill_invocation_message,
+    get_mission_commands,
+    resolve_mission_command_key,
     resolve_skill_command_key,
     scan_skill_commands,
-)
+    )
 
 
 def _make_skill(
@@ -405,3 +408,32 @@ class TestPlanSkillHelpers:
         assert "Add a /plan command" in msg
         assert ".hermes/plans/plan.md" in msg
         assert "Runtime note:" in msg
+
+
+
+class TestMissionCommandHelpers:
+    def test_get_mission_commands_returns_copy(self):
+        commands = get_mission_commands()
+        assert "/missions" in commands
+        commands["/missions"]["action"] = "mutated"
+        assert get_mission_commands()["/missions"]["action"] == "list"
+
+    def test_resolve_mission_command_key_accepts_underscores(self):
+        assert resolve_mission_command_key("missions") == "/missions"
+        assert resolve_mission_command_key("hand_offs") is None
+        assert resolve_mission_command_key("handoffs") == "/handoffs"
+
+    def test_build_mission_command_message_includes_tool_action(self):
+        msg = build_mission_command_message("/mission", "show attached mission", runtime_note="read only")
+        assert msg is not None
+        assert "mission" in msg
+        assert "action `get`" in msg
+        assert "show attached mission" in msg
+        assert "read only" in msg
+
+    def test_build_skill_invocation_message_supports_builtin_mission_commands(self):
+        msg = build_skill_invocation_message("/missions", "show open missions")
+        assert msg is not None
+        assert "mission" in msg
+        assert "action `list`" in msg
+        assert "show open missions" in msg

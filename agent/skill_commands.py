@@ -272,10 +272,20 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
 
 
 def get_skill_commands() -> Dict[str, Dict[str, Any]]:
-    """Return the current skill commands mapping (scan first if empty)."""
+    """Return the current skill commands mapping plus built-in mission reads."""
     if not _skill_commands:
         scan_skill_commands()
-    return _skill_commands
+    commands = dict(_skill_commands)
+    for key, info in _MISSION_COMMANDS.items():
+        commands.setdefault(
+            key,
+            {
+                "name": key.lstrip("/"),
+                "description": info["description"],
+                "builtin_action": info["action"],
+            },
+        )
+    return commands
 
 
 def resolve_skill_command_key(command: str) -> Optional[str]:
@@ -297,6 +307,56 @@ def resolve_skill_command_key(command: str) -> Optional[str]:
     return cmd_key if cmd_key in get_skill_commands() else None
 
 
+_MISSION_COMMANDS: Dict[str, Dict[str, str]] = {
+    "/missions": {
+        "action": "list",
+        "description": "List canonical missions",
+    },
+    "/mission": {
+        "action": "get",
+        "description": "Read the current or specified canonical mission",
+    },
+    "/handoffs": {
+        "action": "list_handoffs",
+        "description": "List mission-linked handoff packets",
+    },
+}
+
+
+
+def get_mission_commands() -> Dict[str, Dict[str, str]]:
+    """Return the built-in mission read command mapping."""
+    return {key: value.copy() for key, value in _MISSION_COMMANDS.items()}
+
+
+def resolve_mission_command_key(command: str) -> Optional[str]:
+    """Resolve a built-in mission command key, treating hyphens/underscores equally."""
+    if not command:
+        return None
+    cmd_key = f"/{command.replace('_', '-')}"
+    return cmd_key if cmd_key in _MISSION_COMMANDS else None
+
+
+def build_mission_command_message(
+    cmd_key: str,
+    user_instruction: str = "",
+    runtime_note: str = "",
+) -> Optional[str]:
+    """Build a user-message payload for a built-in mission read command."""
+    command = _MISSION_COMMANDS.get(cmd_key)
+    if not command:
+        return None
+
+    parts = [
+        f'[SYSTEM: The user invoked the built-in "{cmd_key}" mission command. Use the `mission` tool with action `{command["action"]}` and read only canonical mission state.]',
+    ]
+    if user_instruction:
+        parts.extend(["", f"The user provided this instruction alongside the command: {user_instruction}"])
+    if runtime_note:
+        parts.extend(["", f"[Runtime note: {runtime_note}]"])
+    return "\n".join(parts)
+
+
 def build_skill_invocation_message(
     cmd_key: str,
     user_instruction: str = "",
@@ -316,6 +376,12 @@ def build_skill_invocation_message(
     skill_info = commands.get(cmd_key)
     if not skill_info:
         return None
+    if skill_info.get("builtin_action"):
+        return build_mission_command_message(
+            cmd_key,
+            user_instruction=user_instruction,
+            runtime_note=runtime_note,
+        )
 
     loaded = _load_skill_payload(skill_info["skill_dir"], task_id=task_id)
     if not loaded:

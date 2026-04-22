@@ -239,7 +239,7 @@ class MemoryStore:
 
             # Reject exact duplicates
             if content in entries:
-                return self._success_response(target, "Entry already exists (no duplicate added).")
+                return self._success_response(target, "Entry already exists (no duplicate added).", mutated=False)
 
             # Calculate what the new total would be
             new_entries = entries + [content]
@@ -258,9 +258,14 @@ class MemoryStore:
                     "usage": f"{current:,}/{limit:,}",
                 }
 
+            previous_entries = entries.copy()
             entries.append(content)
             self._set_entries(target, entries)
-            self.save_to_disk(target)
+            try:
+                self.save_to_disk(target)
+            except Exception:
+                self._set_entries(target, previous_entries)
+                raise
 
         return self._success_response(target, "Entry added.")
 
@@ -316,9 +321,14 @@ class MemoryStore:
                     ),
                 }
 
+            previous_entries = entries.copy()
             entries[idx] = new_content
             self._set_entries(target, entries)
-            self.save_to_disk(target)
+            try:
+                self.save_to_disk(target)
+            except Exception:
+                self._set_entries(target, previous_entries)
+                raise
 
         return self._success_response(target, "Entry replaced.")
 
@@ -350,9 +360,14 @@ class MemoryStore:
                 # All identical -- safe to remove just the first
 
             idx = matches[0][0]
+            previous_entries = entries.copy()
             entries.pop(idx)
             self._set_entries(target, entries)
-            self.save_to_disk(target)
+            try:
+                self.save_to_disk(target)
+            except Exception:
+                self._set_entries(target, previous_entries)
+                raise
 
         return self._success_response(target, "Entry removed.")
 
@@ -369,9 +384,31 @@ class MemoryStore:
         block = self._system_prompt_snapshot.get(target, "")
         return block if block else None
 
+    def get_target_state(self, target: str) -> Dict[str, Any]:
+        """Return a read-only view of the live curated-memory state for one target."""
+        entries = list(dict.fromkeys(self._read_file(self._path_for(target))))
+        current = len(ENTRY_DELIMITER.join(entries)) if entries else 0
+        limit = self._char_limit(target)
+        return {
+            "target": target,
+            "entries": entries,
+            "entry_count": len(entries),
+            "char_count": current,
+            "char_limit": limit,
+            "usage": f"{current}/{limit}",
+            "snapshot": self.format_for_system_prompt(target),
+            "path": str(self._path_for(target)),
+        }
+
     # -- Internal helpers --
 
-    def _success_response(self, target: str, message: str = None) -> Dict[str, Any]:
+    def _success_response(
+        self,
+        target: str,
+        message: str = None,
+        *,
+        mutated: bool = True,
+    ) -> Dict[str, Any]:
         entries = self._entries_for(target)
         current = self._char_count(target)
         limit = self._char_limit(target)
@@ -379,6 +416,7 @@ class MemoryStore:
 
         resp = {
             "success": True,
+            "mutated": mutated,
             "target": target,
             "entries": entries,
             "usage": f"{pct}% — {current:,}/{limit:,} chars",

@@ -1,0 +1,202 @@
+version: "3.8"
+
+services:
+  # ── Gateway Router ──
+  gateway:
+    build:
+      context: ..
+      dockerfile: hmaom/Dockerfile
+    container_name: hmaom-gateway
+    environment:
+      - HMAOM_GATEWAY_NAME=gateway
+      - HMAOM_SLM_MODEL=phi-4
+      - HMAOM_FALLBACK_LLM=claude-sonnet-4
+      - HMAOM_LOG_LEVEL=info
+    ports:
+      - "8080:8080"
+    volumes:
+      - gateway-state:/app/state
+      - gateway-checkpoints:/app/checkpoints
+    networks:
+      - hmaom-mesh
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ── Finance Specialist ──
+  finance:
+    build:
+      context: ..
+      dockerfile: hmaom/Dockerfile
+    container_name: hmaom-finance
+    environment:
+      - HMAOM_SPECIALIST_DOMAIN=finance
+      - HMAOM_SPECIALIST_MODEL=claude-sonnet-4
+      - HMAOM_GATEWAY_HOST=gateway
+    volumes:
+      - finance-state:/app/state
+      - finance-skills:/app/skills
+    networks:
+      - hmaom-mesh
+    depends_on:
+      gateway:
+        condition: service_healthy
+
+  # ── Maths Specialist ──
+  maths:
+    build:
+      context: ..
+      dockerfile: hmaom/Dockerfile
+    container_name: hmaom-maths
+    environment:
+      - HMAOM_SPECIALIST_DOMAIN=maths
+      - HMAOM_SPECIALIST_MODEL=claude-sonnet-4
+      - HMAOM_GATEWAY_HOST=gateway
+    volumes:
+      - maths-state:/app/state
+      - maths-skills:/app/skills
+    networks:
+      - hmaom-mesh
+    depends_on:
+      gateway:
+        condition: service_healthy
+
+  # ── Code Specialist ──
+  code:
+    build:
+      context: ..
+      dockerfile: hmaom/Dockerfile
+    container_name: hmaom-code
+    environment:
+      - HMAOM_SPECIALIST_DOMAIN=code
+      - HMAOM_SPECIALIST_MODEL=claude-opus-4
+      - HMAOM_GATEWAY_HOST=gateway
+    volumes:
+      - code-state:/app/state
+      - code-skills:/app/skills
+      - /var/run/docker.sock:/var/run/docker.sock  # For containerized tool execution
+    networks:
+      - hmaom-mesh
+    depends_on:
+      gateway:
+        condition: service_healthy
+
+  # ── Physics Specialist ──
+  physics:
+    build:
+      context: ..
+      dockerfile: hmaom/Dockerfile
+    container_name: hmaom-physics
+    environment:
+      - HMAOM_SPECIALIST_DOMAIN=physics
+      - HMAOM_SPECIALIST_MODEL=claude-sonnet-4
+      - HMAOM_GATEWAY_HOST=gateway
+    volumes:
+      - physics-state:/app/state
+      - physics-skills:/app/skills
+    networks:
+      - hmaom-mesh
+    depends_on:
+      gateway:
+        condition: service_healthy
+
+  # ── Research Specialist ──
+  research:
+    build:
+      context: ..
+      dockerfile: hmaom/Dockerfile
+    container_name: hmaom-research
+    environment:
+      - HMAOM_SPECIALIST_DOMAIN=research
+      - HMAOM_SPECIALIST_MODEL=claude-sonnet-4
+      - HMAOM_GATEWAY_HOST=gateway
+    volumes:
+      - research-state:/app/state
+      - research-skills:/app/skills
+    networks:
+      - hmaom-mesh
+    depends_on:
+      gateway:
+        condition: service_healthy
+
+  # ── Reporter Specialist ──
+  reporter:
+    build:
+      context: ..
+      dockerfile: hmaom/Dockerfile
+    container_name: hmaom-reporter
+    environment:
+      - HMAOM_SPECIALIST_DOMAIN=reporter
+      - HMAOM_SPECIALIST_MODEL=claude-sonnet-4
+      - HMAOM_GATEWAY_HOST=gateway
+    volumes:
+      - reporter-state:/app/state
+      - reporter-skills:/app/skills
+    networks:
+      - hmaom-mesh
+    depends_on:
+      gateway:
+        condition: service_healthy
+
+  # ── Redis (optional, for distributed message bus) ──
+  redis:
+    image: redis:7-alpine
+    container_name: hmaom-redis
+    volumes:
+      - redis-data:/data
+    networks:
+      - hmaom-mesh
+
+  # ── Prometheus (metrics) ──
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: hmaom-prometheus
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - hmaom-mesh
+
+  # ── Grafana (dashboards) ──
+  grafana:
+    image: grafana/grafana:latest
+    container_name: hmaom-grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=hmaom-admin
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    ports:
+      - "3000:3000"
+    networks:
+      - hmaom-mesh
+    depends_on:
+      - prometheus
+
+volumes:
+  gateway-state:
+  gateway-checkpoints:
+  finance-state:
+  finance-skills:
+  maths-state:
+  maths-skills:
+  code-state:
+  code-skills:
+  physics-state:
+  physics-skills:
+  research-state:
+  research-skills:
+  reporter-state:
+  reporter-skills:
+  redis-data:
+  prometheus-data:
+  grafana-data:
+
+networks:
+  hmaom-mesh:
+    driver: bridge

@@ -28,13 +28,49 @@ Fixes #
 
 - 
 
-## How to Test
+## Behavior Contract
 
-<!-- Steps to verify this change works. For bugs: reproduction steps + proof that the fix works. -->
+<!-- Describe the behavior change in reviewable terms. What should users, operators, or other modules observe after this PR? -->
 
-1. 
-2. 
-3. 
+- **Changes:** 
+- **Must remain unchanged:** 
+
+## Acceptance Criteria
+
+<!-- Make these concrete and testable. Prefer observable outcomes over implementation details. -->
+
+- [ ] 
+- [ ] 
+
+## Verification Evidence
+
+<!-- Replace the placeholders with the exact commands, evals, or artifacts you used. -->
+
+| Claim | Command / Eval | Result | Notes |
+|------|----------------|--------|-------|
+| | | | |
+
+## AI-First Review Risks
+
+<!-- Reviewers should focus here before style issues. Use N/A only when truly not applicable. -->
+
+- **Behavior regressions:** 
+- **Security assumptions:** 
+- **Data integrity risks:** 
+- **Failure handling / degraded mode:** 
+- **Rollout / rollback safety:** 
+
+## Interface Boundaries Touched
+
+<!-- Check all that apply. -->
+
+- [ ] None
+- [ ] Tool schema / registry contract
+- [ ] Slash command / CLI surface
+- [ ] Gateway / TUI event contract
+- [ ] Prompt assembly / caching
+- [ ] Memory / session storage
+- [ ] Benchmark / eval harness
 
 ## Checklist
 
@@ -46,8 +82,9 @@ Fixes #
 - [ ] My commit messages follow [Conventional Commits](https://www.conventionalcommits.org/) (`fix(scope):`, `feat(scope):`, etc.)
 - [ ] I searched for [existing PRs](https://github.com/NousResearch/hermes-agent/pulls) to make sure this isn't a duplicate
 - [ ] My PR contains **only** changes related to this fix/feature (no unrelated commits)
-- [ ] I've run `pytest tests/ -q` and all tests pass
-- [ ] I've added tests for my changes (required for bug fixes, strongly encouraged for features)
+- [ ] I've run `scripts/run_tests.sh` or a narrower command that I documented above — or this PR is docs/process-only and I documented why no code-path verification was needed
+- [ ] I've added or updated regression coverage for changed behavior (required for bug fixes, strongly encouraged for features)
+- [ ] I've added explicit edge-case assertions and focused integration checks when this PR crosses a module boundary — or N/A
 - [ ] I've tested on my platform: <!-- e.g. Ubuntu 24.04, macOS 15.2, Windows 11 -->
 
 ### Documentation & Housekeeping

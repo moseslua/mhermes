@@ -37,15 +37,10 @@ jobs:
           source .venv/bin/activate
           uv pip install -e ".[all,dev]"
 
-      - name: Run tests
+      - name: Run hermetic tests
         run: |
           source .venv/bin/activate
-          python -m pytest tests/ -q --ignore=tests/integration --ignore=tests/e2e --tb=short -n auto
-        env:
-          # Ensure tests don't accidentally call real APIs
-          OPENROUTER_API_KEY: ""
-          OPENAI_API_KEY: ""
-          NOUS_API_KEY: ""
+          scripts/run_tests.sh tests/ -q --tb=short
 
   e2e:
     runs-on: ubuntu-latest
@@ -69,7 +64,7 @@ jobs:
       - name: Run e2e tests
         run: |
           source .venv/bin/activate
-          python -m pytest tests/e2e/ -v --tb=short
+          python -m pytest -o "addopts=" tests/e2e/ -v --tb=short -n 4
         env:
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""

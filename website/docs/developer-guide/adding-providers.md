@@ -281,13 +281,11 @@ At minimum, touch the tests that guard provider wiring.
 
 Common places:
 
-- `tests/test_runtime_provider_resolution.py`
-- `tests/test_cli_provider_resolution.py`
-- `tests/test_cli_model_command.py`
-- `tests/test_setup_model_selection.py`
-- `tests/test_provider_parity.py`
-- `tests/test_run_agent.py`
-- `tests/test_<provider>_adapter.py` for a native provider
+- `tests/hermes_cli/test_runtime_provider_resolution.py`
+- `tests/cli/test_cli_provider_resolution.py`
+- `tests/gateway/test_model_command_custom_providers.py`
+- `tests/hermes_cli/test_setup_model_provider.py`
+- `tests/run_agent/test_run_agent.py` or another focused agent-path suite when provider behavior reaches the main loop
 
 For docs-only examples, the exact file set may differ. The point is to cover:
 
@@ -298,18 +296,16 @@ For docs-only examples, the exact file set may differ. The point is to cover:
 - provider:model parsing
 - any adapter-specific message conversion
 
-Run tests with xdist disabled:
+Run targeted tests with the canonical wrapper:
 
 ```bash
-source venv/bin/activate
-python -m pytest tests/test_runtime_provider_resolution.py tests/test_cli_provider_resolution.py tests/test_cli_model_command.py tests/test_setup_model_selection.py -n0 -q
+scripts/run_tests.sh tests/hermes_cli/test_runtime_provider_resolution.py tests/cli/test_cli_provider_resolution.py tests/gateway/test_model_command_custom_providers.py tests/hermes_cli/test_setup_model_provider.py -q
 ```
 
-For deeper changes, run the full suite before pushing:
+For deeper changes, run the default non-integration Python suite before pushing, then add any integration/e2e coverage your change requires:
 
 ```bash
-source venv/bin/activate
-python -m pytest tests/ -n0 -q
+scripts/run_tests.sh tests/ -q
 ```
 
 ## Step 9: Live verification

@@ -113,10 +113,17 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
         from tools.env_passthrough import is_env_passthrough as _is_passthrough
     except Exception:
         _is_passthrough = lambda _: False  # noqa: E731
+    try:
+        from gateway.session_context import get_session_env_overrides
+        session_overrides = get_session_env_overrides()
+    except Exception:
+        session_overrides = {}
 
     sanitized: dict[str, str] = {}
+    merged_base = dict(base_env or {})
+    merged_base.update(session_overrides)
 
-    for key, value in (base_env or {}).items():
+    for key, value in merged_base.items():
         if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             continue
         if key not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(key):
@@ -129,7 +136,6 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
         elif key not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(key):
             sanitized[key] = value
 
-    # Per-profile HOME isolation for background processes (same as _make_run_env).
     from hermes_constants import get_subprocess_home
     _profile_home = get_subprocess_home()
     if _profile_home:
@@ -189,8 +195,15 @@ def _make_run_env(env: dict) -> dict:
         from tools.env_passthrough import is_env_passthrough as _is_passthrough
     except Exception:
         _is_passthrough = lambda _: False  # noqa: E731
+    try:
+        from gateway.session_context import get_session_env_overrides
+        session_overrides = get_session_env_overrides()
+    except Exception:
+        session_overrides = {}
 
-    merged = dict(os.environ | env)
+    merged = dict(os.environ)
+    merged.update(session_overrides)
+    merged.update(env)
     run_env = {}
     for k, v in merged.items():
         if k.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
@@ -202,9 +215,6 @@ def _make_run_env(env: dict) -> dict:
     if "/usr/bin" not in existing_path.split(":"):
         run_env["PATH"] = f"{existing_path}:{_SANE_PATH}" if existing_path else _SANE_PATH
 
-    # Per-profile HOME isolation: redirect system tool configs (git, ssh, gh,
-    # npm …) into {HERMES_HOME}/home/ when that directory exists.  Only the
-    # subprocess sees the override — the Python process keeps the real HOME.
     from hermes_constants import get_subprocess_home
     _profile_home = get_subprocess_home()
     if _profile_home:
