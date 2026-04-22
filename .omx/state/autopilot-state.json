@@ -1,15 +1,31 @@
 {
   "active": true,
-  "current_phase": "qa",
-  "started_at": "2026-04-20T17:45:00Z",
-  "features": [
-    "Prompt Registry & Versioning",
-    "Elastic Replica Manager",
-    "Cost-Aware Model Router"
+  "current_phase": "validation",
+  "started_at": "2026-04-20T20:00:00Z",
+  "branch": "feat/all-features-integration",
+  "phase4_round": 1,
+  "context_snapshot": ".omx/context/hermes-all-features-20260420T174500Z.md",
+  "new_files": [
+    "agent/runtime_policy.py",
+    "agent/proposal_engine.py",
+    "agent/model_ops.py",
+    "agent/state_projections.py",
+    "packaging/fly/Dockerfile",
+    "packaging/fly/docker/entrypoint.sh",
+    "packaging/fly/fly.toml",
+    "tests/agent/test_runtime_policy.py",
+    "tests/agent/test_proposal_engine.py",
+    "tests/agent/test_model_ops.py",
+    "tests/agent/test_state_projections.py",
+    "tests/agent/test_runtime_signals.py"
   ],
-  "completed_at": "2026-04-20T00:00:00Z",
-  "task": "Hermes All-Features Integration",
-  "prd_path": ".omx/plans/prd-hermes-all-features-integration.md",
-  "test_spec_path": ".omx/plans/test-spec-hermes-all-features-integration.md",
-  "existing_impl_plan": ".omx/plans/autopilot-impl.md"
+  "modified_files": [
+    "hermes_state.py",
+    "hermes_cli/model_switch.py",
+    "hermes_cli/web_server.py",
+    "hermes_constants.py",
+    "run_agent.py",
+    "model_tools.py",
+    "tools/approval.py"
+  ]
 }

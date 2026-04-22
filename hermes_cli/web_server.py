@@ -802,10 +802,22 @@ async def reveal_env_var(body: EnvVarReveal, request: Request):
     Protected by:
     - Ephemeral session token (generated per server start, injected into SPA)
     - Rate limiting (max 5 reveals per 30s window)
+    - Protected-key blocking (API keys, base URLs, model/provider identity)
     - Audit logging
     """
     # --- Token check ---
     _require_token(request)
+
+    # --- Protected-key guard ---
+    from agent.model_ops import ModelOpsService
+    if ModelOpsService.is_protected_key(body.key):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"{body.key} is a protected model-identity key. "
+                "Reveal is not permitted for security reasons."
+            ),
+        )
 
     # --- Rate limit ---
     now = time.time()

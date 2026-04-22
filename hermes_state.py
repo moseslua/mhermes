@@ -1971,6 +1971,38 @@ class SessionDB:
             return cursor.rowcount
         return self._execute_write(_do) > 0
 
+
+    def approve_model_mutation_atomic(self, mutation_id: str) -> bool:
+        """Atomically approve a pending mutation. Returns True if transitioned."""
+        now = time.time()
+
+        def _do(conn):
+            # Atomically transition pending → approved, capturing old_value as rollback
+            cursor = conn.execute(
+                """UPDATE model_mutations
+                   SET status = ?, updated_at = ?, rollback_value = old_value
+                   WHERE id = ? AND status = 'pending'""",
+                ("approved", now, mutation_id),
+            )
+            return cursor.rowcount
+
+        return self._execute_write(_do) > 0
+
+    def execute_model_mutation_atomic(self, mutation_id: str) -> bool:
+        """Atomically execute an approved mutation. Returns True if transitioned."""
+        now = time.time()
+
+        def _do(conn):
+            cursor = conn.execute(
+                """UPDATE model_mutations
+                   SET status = ?, updated_at = ?
+                   WHERE id = ? AND status = 'approved'""",
+                ("executed", now, mutation_id),
+            )
+            return cursor.rowcount
+
+        return self._execute_write(_do) > 0
+
     def delete_model_mutation(self, mutation_id: str) -> bool:
         """Delete a model mutation by ID."""
         def _do(conn):

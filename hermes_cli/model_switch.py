@@ -1159,8 +1159,13 @@ def persist_model_switch(result: ModelSwitchResult, session_id: str = "") -> Non
         ops.create_mutation(sid, "provider", "", result.target_provider)
     if result.base_url:
         ops.create_mutation(sid, "base_url", "", result.base_url)
+    # Do not store raw API key in mutation table; log the change without the secret
     if result.api_key:
-        ops.create_mutation(sid, "api_key", "", result.api_key)
+        ops.create_mutation(sid, "api_key", "", "***redacted***")
+    # Auto-execute the mutations since the switch has already been applied
+    for mut in ops.list_mutations(session_id=sid, status="pending"):
+        ops.approve_mutation(mut["id"])
+        ops.execute_mutation(mut["id"])
 
 
 def _apply_model_switch_via_ops(

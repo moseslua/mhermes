@@ -78,7 +78,7 @@ class ModelOpsService:
             new_value=new_value,
             status="pending",
         )
-        logger.info("Created mutation %s: %s -> %s", mutation_id, key, new_value)
+        logger.info("Created mutation %s for key %s", mutation_id, key)
         return mutation_id
 
     def get_mutation(self, mutation_id: str) -> Optional[Dict]:
@@ -95,21 +95,11 @@ class ModelOpsService:
         )
 
     def approve_mutation(self, mutation_id: str) -> bool:
-        """Approve a pending mutation."""
-        mut = self.db.get_model_mutation(mutation_id)
-        if not mut:
-            logger.warning("approve_mutation: %s not found", mutation_id)
+        """Approve a pending mutation atomically."""
+        ok = self.db.approve_model_mutation_atomic(mutation_id)
+        if not ok:
+            logger.warning("approve_mutation: %s not found or not pending", mutation_id)
             return False
-        if mut["status"] != "pending":
-            logger.warning(
-                "approve_mutation: %s is %s, not pending",
-                mutation_id,
-                mut["status"],
-            )
-            return False
-        self.db.update_model_mutation_status(
-            mutation_id, "approved", rollback_value=mut["old_value"]
-        )
         logger.info("Approved mutation %s", mutation_id)
         return True
 
@@ -124,7 +114,7 @@ class ModelOpsService:
                 "execute_mutation: %s is %s, not approved",
                 mutation_id,
                 mut["status"],
-            )
+)
             return False
 
         key = mut["key"]
@@ -141,8 +131,11 @@ class ModelOpsService:
 
             save_env_value(key, new_value)
 
-        self.db.update_model_mutation_status(mutation_id, "executed")
-        logger.info("Executed mutation %s: %s = %s", mutation_id, key, new_value)
+        ok = self.db.execute_model_mutation_atomic(mutation_id)
+        if not ok:
+            logger.warning("execute_mutation: %s was modified concurrently", mutation_id)
+            return False
+        logger.info("Executed mutation %s for key %s", mutation_id, key)
         return True
 
     def rollback_mutation(self, mutation_id: str) -> bool:
@@ -156,7 +149,7 @@ class ModelOpsService:
                 "rollback_mutation: %s is %s, not executed",
                 mutation_id,
                 mut["status"],
-            )
+)
             return False
 
         key = mut["key"]
@@ -173,7 +166,7 @@ class ModelOpsService:
             save_env_value(key, rollback_value)
 
         self.db.update_model_mutation_status(mutation_id, "rolled_back")
-        logger.info("Rolled back mutation %s: %s = %s", mutation_id, key, rollback_value)
+        logger.info("Rolled back mutation %s for key %s", mutation_id, key)
         return True
 
     # ------------------------------------------------------------------
@@ -184,31 +177,42 @@ class ModelOpsService:
         """
         Scan ``.env`` for protected keys that were modified outside the
         mutation workflow (i.e. no executed mutation covers the current value).
+        Values are redacted in the returned report.
         """
         from hermes_cli.config import load_env
 
+        def _redact(value: str) -> str:
+            if not value:
+                return value
+            if len(value) <= 12:
+                return "***"
+            return value[:4] + "..." + value[-4:]
+
         env_vars = load_env()
         drift_items: List[Dict] = []
+        # Hoist: fetch all executed mutations once
+        mutations = self.db.list_model_mutations(status="executed", limit=1000)
+        mutations_by_key: Dict[str, List[Dict]] = {}
+        for m in mutations:
+            mutations_by_key.setdefault(m["key"], []).append(m)
+
         for key, value in env_vars.items():
             if not _is_protected_key(key):
                 continue
-            # Look for the most recent executed mutation for this key
-            mutations = self.db.list_model_mutations(status="executed", limit=1000)
-            key_muts = [m for m in mutations if m["key"] == key]
+            key_muts = mutations_by_key.get(key, [])
             if not key_muts:
-                # No mutation history at all — direct edit
                 drift_items.append({
                     "key": key,
-                    "current_value": value,
+                    "current_value": _redact(value),
                     "last_mutation_value": None,
                 })
                 continue
-            latest = max(key_muts, key=lambda m: m["updated_at"] or 0)
+            latest = max(key_muts, key=lambda m: m.get("updated_at") or 0)
             if latest["new_value"] != value:
                 drift_items.append({
                     "key": key,
-                    "current_value": value,
-                    "last_mutation_value": latest["new_value"],
+                    "current_value": _redact(value),
+                    "last_mutation_value": _redact(latest["new_value"]),
                 })
         if drift_items:
             logger.warning("Detected %d drifted env var(s)", len(drift_items))

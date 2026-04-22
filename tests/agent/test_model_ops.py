@@ -158,7 +158,7 @@ class TestDriftDetection:
         drift = ops.detect_drift()
         assert len(drift) == 1
         assert drift[0]["key"] == "OPENAI_API_KEY"
-        assert drift[0]["current_value"] == "direct-key"
+        assert drift[0]["current_value"] == "***"
         assert drift[0]["last_mutation_value"] is None
 
     @patch("hermes_cli.config.load_env")
@@ -180,8 +180,8 @@ class TestDriftDetection:
 
         drift = ops.detect_drift()
         assert len(drift) == 1
-        assert drift[0]["last_mutation_value"] == "mutated-key"
-        assert drift[0]["current_value"] == "tampered-key"
+        assert drift[0]["last_mutation_value"] == "***"
+        assert drift[0]["current_value"] == "***"
 
     @patch("hermes_cli.config.load_env")
     def test_detect_drift_ignores_non_protected(self, mock_load_env, ops):

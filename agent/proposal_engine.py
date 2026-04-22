@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import time
 import uuid
 from pathlib import Path
@@ -18,11 +19,11 @@ from typing import Any, Dict, List, Optional
 
 from hermes_constants import get_hermes_home
 from hermes_state import SessionDB
+from agent.state_projections import _atomic_write
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_SCAFFOLD_DIR = get_hermes_home() / "proposals"
-
 # Patterns we can detect from message history or tool usage
 _WORKFLOW_PATTERNS: Dict[str, Dict[str, Any]] = {
     "skill_from_tools": {
@@ -193,7 +194,9 @@ class ProposalEngine:
         # Build a stable filename from type + sorted context keys
         ctx_json = json.dumps(context, sort_keys=True, default=str)
         digest = hashlib.sha256(ctx_json.encode()).hexdigest()[:16]
-        filename = f"{proposal_type}_{digest}.json"
+        # Sanitize proposal_type to prevent path traversal
+        safe_type = re.sub(r"[^a-zA-Z0-9_-]", "_", proposal_type)
+        filename = f"{safe_type}_{digest}.json"
         scaffold_path = self.scaffold_dir / filename
 
         scaffold = {
@@ -203,9 +206,10 @@ class ProposalEngine:
             "template": self._scaffold_template(proposal_type),
         }
 
-        scaffold_path.write_text(
+        _atomic_write(
+            scaffold_path,
             json.dumps(scaffold, indent=2, default=str),
-            encoding="utf-8",
+            mode="w",
         )
         logger.info("Generated scaffold: %s", scaffold_path)
         return str(scaffold_path)

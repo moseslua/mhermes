@@ -8143,13 +8143,17 @@ class AIAgent:
             )
         else:
             invoke_post_tool_hook = False
-            result = handle_function_call(
-                function_name, function_args, effective_task_id,
-                tool_call_id=tool_call_id,
-                session_id=self.session_id or "",
-                enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
-                skip_pre_tool_call_hook=True,
-            )
+            block_reason = self._check_tool_policy(function_name)
+            if block_reason:
+                result = json.dumps({"error": f"Policy blocked: {block_reason}"}, ensure_ascii=False)
+            else:
+                result = handle_function_call(
+                    function_name, function_args, effective_task_id,
+                    tool_call_id=tool_call_id,
+                    session_id=self.session_id or "",
+                    enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
+                    skip_pre_tool_call_hook=True,
+                )
 
         phase = "failed" if _detect_tool_failure(function_name, result)[0] else "completed"
         self._emit_post_tool_signal(
@@ -8786,13 +8790,17 @@ class AIAgent:
                 _spinner_result = None
                 invoke_post_tool_hook = False
                 try:
-                    function_result = handle_function_call(
-                        function_name, function_args, effective_task_id,
-                        tool_call_id=tool_call.id,
-                        session_id=self.session_id or "",
-                        enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
-                        skip_pre_tool_call_hook=True,
-                    )
+                    block_reason = self._check_tool_policy(function_name)
+                    if block_reason:
+                        function_result = json.dumps({"error": f"Policy blocked: {block_reason}"}, ensure_ascii=False)
+                    else:
+                        function_result = handle_function_call(
+                            function_name, function_args, effective_task_id,
+                            tool_call_id=tool_call.id,
+                            session_id=self.session_id or "",
+                            enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
+                            skip_pre_tool_call_hook=True,
+                        )
                     _spinner_result = function_result
                 except Exception as tool_error:
                     function_result = f"Error executing tool '{function_name}': {tool_error}"
@@ -8808,13 +8816,17 @@ class AIAgent:
                 invoke_post_tool_hook = False
 
                 try:
-                    function_result = handle_function_call(
-                        function_name, function_args, effective_task_id,
-                        tool_call_id=tool_call.id,
-                        session_id=self.session_id or "",
-                        enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
-                        skip_pre_tool_call_hook=True,
-                    )
+                    block_reason = self._check_tool_policy(function_name)
+                    if block_reason:
+                        function_result = json.dumps({"error": f"Policy blocked: {block_reason}"}, ensure_ascii=False)
+                    else:
+                        function_result = handle_function_call(
+                            function_name, function_args, effective_task_id,
+                            tool_call_id=tool_call.id,
+                            session_id=self.session_id or "",
+                            enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
+                            skip_pre_tool_call_hook=True,
+                        )
                 except Exception as tool_error:
                     function_result = f"Error executing tool '{function_name}': {tool_error}"
                     logger.error("handle_function_call raised for %s: %s", function_name, tool_error, exc_info=True)
@@ -9577,6 +9589,8 @@ class AIAgent:
                     api_msg.pop("finish_reason")
                 # Strip internal thinking-prefill marker
                 api_msg.pop("_thinking_prefill", None)
+                # Strip internal provenance tag - not accepted by strict APIs
+                api_msg.pop("_provenance", None)
                 # Strip Codex Responses API fields (call_id, response_item_id) for
                 # strict providers like Mistral, Fireworks, etc. that reject unknown fields.
                 # Uses new dicts so the internal messages list retains the fields
