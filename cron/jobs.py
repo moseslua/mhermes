@@ -9,6 +9,7 @@ import copy
 import json
 import logging
 import tempfile
+import threading
 import os
 import re
 import uuid
@@ -34,6 +35,11 @@ except ImportError:
 HERMES_DIR = get_hermes_home().resolve()
 CRON_DIR = HERMES_DIR / "cron"
 JOBS_FILE = CRON_DIR / "jobs.json"
+
+# In-process lock protecting load_jobs→modify→save_jobs cycles.
+# Required when tick() runs jobs in parallel threads — without this,
+# concurrent mark_job_run / advance_next_run calls can clobber each other.
+_jobs_file_lock = threading.Lock()
 OUTPUT_DIR = CRON_DIR / "output"
 ONESHOT_GRACE_SECONDS = 120
 
@@ -780,97 +786,115 @@ def mark_job_run(
     error: Optional[str] = None,
     delivery_error: Optional[str] = None,
     reactive_failure_at: Optional[str] = None,
- ):
-    """Mark a job as having been run and update health metrics."""
-    jobs = load_jobs()
-    for i, job in enumerate(jobs):
-        if job["id"] == job_id:
-            normalized = _apply_skill_fields(job)
-            job.clear()
-            job.update(normalized)
+):
+    """
+    Mark a job as having been run and update health metrics.
 
-            now = _hermes_now().isoformat()
-            job["last_run_at"] = now
-            job["last_status"] = "ok" if success else "error"
-            job["last_error"] = error if not success else None
-            job["last_delivery_error"] = delivery_error
+    Updates last_run_at, last_status, health metrics, computes next_run_at,
+    and auto-deletes if repeat limit reached.
 
-            health = _normalize_health(job.get("health"))
-            health["total_runs"] += 1
-            if success:
-                health["total_successes"] += 1
-                health["consecutive_failures"] = 0
-                health["last_success_at"] = now
-            else:
-                health["total_failures"] += 1
-                health["consecutive_failures"] += 1
-                health["last_failure_at"] = now
-            total_runs = health["total_runs"]
-            health["success_rate"] = round(health["total_successes"] / total_runs, 4) if total_runs else None
-            job["health"] = health
+    ``delivery_error`` is tracked separately from the agent error — a job
+    can succeed (agent produced output) but fail delivery (platform down).
+    """
+    with _jobs_file_lock:
+        jobs = load_jobs()
+        for i, job in enumerate(jobs):
+            if job["id"] == job_id:
+                normalized = _apply_skill_fields(job)
+                job.clear()
+                job.update(normalized)
 
-            trigger = job.get("reactive_trigger")
-            if trigger and reactive_failure_at and success:
-                trigger["last_seen_failure_at"] = reactive_failure_at
-                job["reactive_trigger"] = trigger
+                now = _hermes_now().isoformat()
+                job["last_run_at"] = now
+                job["last_status"] = "ok" if success else "error"
+                job["last_error"] = error if not success else None
+                job["last_delivery_error"] = delivery_error
 
-            if job.get("repeat"):
-                job["repeat"]["completed"] = job["repeat"].get("completed", 0) + 1
+                health = _normalize_health(job.get("health"))
+                health["total_runs"] += 1
+                if success:
+                    health["total_successes"] += 1
+                    health["consecutive_failures"] = 0
+                    health["last_success_at"] = now
+                else:
+                    health["total_failures"] += 1
+                    health["consecutive_failures"] += 1
+                    health["last_failure_at"] = now
+                total_runs = health["total_runs"]
+                health["success_rate"] = round(health["total_successes"] / total_runs, 4) if total_runs else None
+                job["health"] = health
 
-                times = job["repeat"].get("times")
-                completed = job["repeat"]["completed"]
-                if times is not None and times > 0 and completed >= times:
-                    if success and not _has_reactive_dependents(job_id, jobs):
-                        jobs.pop(i)
+                trigger = job.get("reactive_trigger")
+                if trigger and reactive_failure_at and success:
+                    trigger["last_seen_failure_at"] = reactive_failure_at
+                    job["reactive_trigger"] = trigger
+
+                if job.get("repeat"):
+                    job["repeat"]["completed"] = job["repeat"].get("completed", 0) + 1
+
+                    times = job["repeat"].get("times")
+                    completed = job["repeat"]["completed"]
+                    if times is not None and times > 0 and completed >= times:
+                        if success and not _has_reactive_dependents(job_id, jobs):
+                            jobs.pop(i)
+                            save_jobs(jobs)
+                            return
+                        job["next_run_at"] = None
+                        job["enabled"] = False
+                        job["state"] = "completed"
                         save_jobs(jobs)
                         return
+
+                schedule = job.get("schedule")
+                if schedule:
+                    job["next_run_at"] = compute_next_run(schedule, now)
+                elif job.get("reactive_trigger"):
+                    job["next_run_at"] = None
+                    if job.get("state") != "paused":
+                        job["state"] = "reactive_waiting"
+                        job["enabled"] = True
+                else:
                     job["next_run_at"] = None
                     job["enabled"] = False
                     job["state"] = "completed"
-                    save_jobs(jobs)
-                    return
 
-            schedule = job.get("schedule")
-            if schedule:
-                job["next_run_at"] = compute_next_run(schedule, now)
-                if job["next_run_at"] is None:
-                    job["enabled"] = False
-                    job["state"] = "completed"
-                elif job.get("state") != "paused":
-                    job["state"] = "scheduled"
-            elif job.get("reactive_trigger"):
-                job["next_run_at"] = None
                 if job.get("state") != "paused":
-                    job["state"] = "reactive_waiting"
-                    job["enabled"] = True
-            else:
-                job["next_run_at"] = None
-                job["enabled"] = False
-                job["state"] = "completed"
+                    job["state"] = "scheduled" if job.get("schedule") else ("reactive_waiting" if job.get("reactive_trigger") else "completed")
 
-            save_jobs(jobs)
-            return
+                save_jobs(jobs)
+                return
 
-    logger.warning("mark_job_run: job_id %s not found, skipping save", job_id)
+
+        logger.warning("mark_job_run: job_id %s not found, skipping save", job_id)
 
 
 def advance_next_run(job_id: str) -> bool:
-    """Preemptively advance next_run_at for a recurring scheduled job before execution."""
-    jobs = load_jobs()
-    for job in jobs:
-        if job["id"] == job_id:
-            schedule = job.get("schedule") or {}
-            kind = schedule.get("kind")
-            if kind not in ("cron", "interval"):
+    """Preemptively advance next_run_at for a recurring job before execution.
+
+    Call this BEFORE run_job() so that if the process crashes mid-execution,
+    the job won't re-fire on the next gateway restart.  This converts the
+    scheduler from at-least-once to at-most-once for recurring jobs — missing
+    one run is far better than firing dozens of times in a crash loop.
+
+    One-shot jobs are left unchanged so they can still retry on restart.
+
+    Returns True if next_run_at was advanced, False otherwise.
+    """
+    with _jobs_file_lock:
+        jobs = load_jobs()
+        for job in jobs:
+            if job["id"] == job_id:
+                kind = job.get("schedule", {}).get("kind")
+                if kind not in ("cron", "interval"):
+                    return False
+                now = _hermes_now().isoformat()
+                new_next = compute_next_run(job["schedule"], now)
+                if new_next and new_next != job.get("next_run_at"):
+                    job["next_run_at"] = new_next
+                    save_jobs(jobs)
+                    return True
                 return False
-            now = _hermes_now().isoformat()
-            new_next = compute_next_run(schedule, now)
-            if new_next and new_next != job.get("next_run_at"):
-                job["next_run_at"] = new_next
-                save_jobs(jobs)
-                return True
-            return False
-    return False
+        return False
 
 
 def get_due_jobs() -> List[Dict[str, Any]]:

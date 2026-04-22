@@ -26,6 +26,13 @@ _WEIXIN_TARGET_RE = re.compile(r"^\s*((?:wxid|gh|v\d+|wm|wb)_[A-Za-z0-9_-]+|[A-Z
 _MATRIX_TARGET_RE = re.compile(r"^\s*([!#][^:\s]+:[^\s]+)\s*$")
 # Discord snowflake IDs are numeric, same regex pattern as Telegram topic targets.
 _NUMERIC_TOPIC_RE = _TELEGRAM_TOPIC_TARGET_RE
+# Platforms that address recipients by phone number and accept E.164 format
+# (with a leading '+'). Without this, "+15551234567" fails the isdigit() check
+# below and falls through to channel-name resolution, which has no way to
+# resolve a raw phone number. Keeping the '+' preserves the E.164 form that
+# downstream adapters (signal, etc.) expect.
+_PHONE_PLATFORMS = frozenset({"signal", "sms", "whatsapp"})
+_E164_TARGET_RE = re.compile(r"^\s*\+(\d{7,15})\s*$")
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".3gp"}
 _AUDIO_EXTS = {".ogg", ".opus", ".mp3", ".wav", ".m4a"}
@@ -250,9 +257,8 @@ def _handle_send(args):
         # Weixin can be configured purely via .env; synthesize a pconfig so
         # send_message and cron delivery work without a gateway.yaml entry.
         if platform_name == "weixin":
-            import os
-            wx_token = _runtime_env("WEIXIN_TOKEN", "").strip()
-            wx_account = _runtime_env("WEIXIN_ACCOUNT_ID", "").strip()
+            wx_token = os.getenv("WEIXIN_TOKEN", "").strip()
+            wx_account = os.getenv("WEIXIN_ACCOUNT_ID", "").strip()
             if wx_token and wx_account:
                 from gateway.config import PlatformConfig
                 pconfig = PlatformConfig(
@@ -278,8 +284,7 @@ def _handle_send(args):
     if not chat_id:
         home = config.get_home_channel(platform)
         if not home and platform_name == "weixin":
-            import os
-            wx_home = _runtime_env("WEIXIN_HOME_CHANNEL", "").strip()
+            wx_home = os.getenv("WEIXIN_HOME_CHANNEL", "").strip()
             if wx_home:
                 from gateway.config import HomeChannel
                 home = HomeChannel(platform=platform, chat_id=wx_home, name="Weixin Home")
@@ -348,7 +353,16 @@ def _parse_target_ref(platform_name: str, target_ref: str):
         match = _WEIXIN_TARGET_RE.fullmatch(target_ref)
         if match:
             return match.group(1), None, True
-    if platform_name != "matrix" and target_ref.lstrip("-").isdigit():
+    if platform_name in _PHONE_PLATFORMS:
+        match = _E164_TARGET_RE.fullmatch(target_ref)
+        if match:
+            # Preserve the leading '+' — signal-cli and sms/whatsapp adapters
+            # expect E.164 format for direct recipients.
+            return target_ref.strip(), None, True
+    if target_ref.lstrip("-").isdigit():
+        return target_ref, None, True
+    # Matrix room IDs (start with !) and user IDs (start with @) are explicit
+    if platform_name == "matrix" and (target_ref.startswith("!") or target_ref.startswith("@")):
         return target_ref, None, True
     match = _MATRIX_TARGET_RE.fullmatch(target_ref)
     if platform_name == "matrix" and match:
@@ -410,9 +424,18 @@ def _get_cron_auto_delivery_targets():
 
 
 def _get_cron_auto_delivery_target():
-    """Return the cron scheduler's first auto-delivery target for the current run, if any."""
-    targets = _get_cron_auto_delivery_targets()
-    return targets[0] if targets else None
+    """Return the cron scheduler's auto-delivery target for the current run, if any."""
+    from gateway.session_context import get_session_env
+    platform = get_session_env("HERMES_CRON_AUTO_DELIVER_PLATFORM", "").strip().lower()
+    chat_id = get_session_env("HERMES_CRON_AUTO_DELIVER_CHAT_ID", "").strip()
+    if not platform or not chat_id:
+        return None
+    thread_id = get_session_env("HERMES_CRON_AUTO_DELIVER_THREAD_ID", "").strip() or None
+    return {
+        "platform": platform,
+        "chat_id": chat_id,
+        "thread_id": thread_id,
+    }
 
 
 def _maybe_skip_cron_duplicate_send(platform_name: str, chat_id: str, thread_id: str | None):
@@ -563,11 +586,27 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             last_result = result
         return last_result
 
-    # --- Non-Telegram/Discord platforms ---
+    # --- Signal: native attachment support via JSON-RPC attachments param ---
+    if platform == Platform.SIGNAL and media_files:
+        last_result = None
+        for i, chunk in enumerate(chunks):
+            is_last = (i == len(chunks) - 1)
+            result = await _send_signal(
+                pconfig.extra,
+                chat_id,
+                chunk,
+                media_files=media_files if is_last else [],
+            )
+            if isinstance(result, dict) and result.get("error"):
+                return result
+            last_result = result
+        return last_result
+
+    # --- Non-media platforms ---
     if media_files and not message.strip():
         return {
             "error": (
-                f"send_message MEDIA delivery is currently only supported for telegram, discord, matrix, and weixin; "
+                f"send_message MEDIA delivery is currently only supported for telegram, discord, matrix, weixin, and signal; "
                 f"target {platform.value} had only media attachments"
             )
         }
@@ -575,7 +614,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     if media_files:
         warning = (
             f"MEDIA attachments were omitted for {platform.value}; "
-            "native send_message media delivery is currently only supported for telegram, discord, matrix, and weixin"
+            "native send_message media delivery is currently only supported for telegram, discord, matrix, weixin, and signal"
         )
 
     last_result = None
@@ -1021,8 +1060,12 @@ async def _send_whatsapp(extra, chat_id, message):
         return _error(f"WhatsApp send failed: {e}")
 
 
-async def _send_signal(extra, chat_id, message):
-    """Send via signal-cli JSON-RPC API."""
+async def _send_signal(extra, chat_id, message, media_files=None):
+    """Send via signal-cli JSON-RPC API.
+
+    Supports both text-only and text-with-attachments (images/audio/documents).
+    Attachments are sent as an 'attachments' array in the JSON-RPC params.
+    """
     try:
         import httpx
     except ImportError:
@@ -1039,6 +1082,18 @@ async def _send_signal(extra, chat_id, message):
         else:
             params["recipient"] = [chat_id]
 
+        # Add attachments if media_files are present
+        valid_media = media_files or []
+        attachment_paths = []
+        for media_path, _is_voice in valid_media:
+            if os.path.exists(media_path):
+                attachment_paths.append(media_path)
+            else:
+                logger.warning("Signal media file not found, skipping: %s", media_path)
+
+        if attachment_paths:
+            params["attachments"] = attachment_paths
+
         payload = {
             "jsonrpc": "2.0",
             "method": "send",
@@ -1052,7 +1107,12 @@ async def _send_signal(extra, chat_id, message):
             data = resp.json()
             if "error" in data:
                 return _error(f"Signal RPC error: {data['error']}")
-            return {"success": True, "platform": "signal", "chat_id": chat_id}
+
+            # Return warning for any skipped media files
+            result = {"success": True, "platform": "signal", "chat_id": chat_id}
+            if len(attachment_paths) < len(valid_media):
+                result["warnings"] = [f"Some media files were skipped (not found on disk)"]
+            return result
     except Exception as e:
         return _error(f"Signal send failed: {e}")
 

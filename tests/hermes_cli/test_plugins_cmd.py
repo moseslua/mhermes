@@ -468,6 +468,7 @@ class TestCmdUpdate:
         mock_run_guard.assert_not_called()
 
 
+    @patch("hermes_cli.plugins_cmd._sanitize_plugin_name")
     @patch("hermes_cli.plugins_cmd._plugins_dir")
     def test_update_plugin_not_found(self, mock_plugins_dir, mock_sanitize):
         from hermes_cli.plugins_cmd import cmd_update
