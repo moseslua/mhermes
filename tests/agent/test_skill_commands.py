@@ -5,6 +5,8 @@ from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 import tools.skills_tool as skills_tool_module
 from agent.skill_commands import (
     build_mission_command_message,
@@ -410,7 +412,6 @@ class TestPlanSkillHelpers:
         assert "Runtime note:" in msg
 
 
-
 class TestMissionCommandHelpers:
     def test_get_mission_commands_returns_copy(self):
         commands = get_mission_commands()
@@ -437,3 +438,130 @@ class TestMissionCommandHelpers:
         assert "mission" in msg
         assert "action `list`" in msg
         assert "show open missions" in msg
+
+
+class TestSkillDirectoryHeader:
+    """The activation message must expose the absolute skill directory and
+    explain how to resolve relative paths, so skills with bundled scripts
+    don't force the agent into a second ``skill_view()`` round-trip."""
+
+    def test_header_contains_absolute_skill_dir(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            skill_dir = _make_skill(tmp_path, "abs-dir-skill")
+            scan_skill_commands()
+            msg = build_skill_invocation_message("/abs-dir-skill", "go")
+
+        assert msg is not None
+        assert f"[Skill directory: {skill_dir}]" in msg
+        assert "Resolve any relative paths" in msg
+
+    def test_supporting_files_shown_with_absolute_paths(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            skill_dir = _make_skill(tmp_path, "scripted-skill")
+            (skill_dir / "scripts").mkdir()
+            (skill_dir / "scripts" / "run.js").write_text("console.log('hi')")
+            scan_skill_commands()
+            msg = build_skill_invocation_message("/scripted-skill")
+
+        assert msg is not None
+        # The supporting-files block must emit both the relative form (so the
+        # agent can call skill_view on it) and the absolute form (so it can
+        # run the script directly via terminal).
+        assert "scripts/run.js" in msg
+        assert str(skill_dir / "scripts" / "run.js") in msg
+        assert f"node {skill_dir}/scripts/foo.js" in msg
+
+
+class TestTemplateVarSubstitution:
+    """``${HERMES_SKILL_DIR}`` and ``${HERMES_SESSION_ID}`` in SKILL.md body
+    are replaced before the agent sees the content."""
+
+    def test_substitutes_skill_dir(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            skill_dir = _make_skill(
+                tmp_path,
+                "templated",
+                body="Run: node ${HERMES_SKILL_DIR}/scripts/foo.js",
+            )
+            scan_skill_commands()
+            msg = build_skill_invocation_message("/templated")
+
+        assert msg is not None
+        assert f"node {skill_dir}/scripts/foo.js" in msg
+        # The literal template token must not leak through.
+        assert "${HERMES_SKILL_DIR}" not in msg.split("[Skill directory:")[0]
+
+    def test_substitutes_session_id_when_available(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(
+                tmp_path,
+                "sess-templated",
+                body="Session: ${HERMES_SESSION_ID}",
+            )
+            scan_skill_commands()
+            msg = build_skill_invocation_message(
+                "/sess-templated", task_id="abc-123"
+            )
+
+        assert msg is not None
+        assert "Session: abc-123" in msg
+
+    def test_leaves_session_id_token_when_missing(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(
+                tmp_path,
+                "sess-missing",
+                body="Session: ${HERMES_SESSION_ID}",
+            )
+            scan_skill_commands()
+            msg = build_skill_invocation_message("/sess-missing", task_id=None)
+
+        assert msg is not None
+        # No session — token left intact so the author can spot it.
+        assert "Session: ${HERMES_SESSION_ID}" in msg
+
+    def test_disable_template_vars_via_config(self, tmp_path):
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", tmp_path),
+            patch(
+                "agent.skill_commands._load_skills_config",
+                return_value={"template_vars": False},
+            ),
+        ):
+            _make_skill(
+                tmp_path,
+                "no-vars",
+                body="Run: node ${HERMES_SKILL_DIR}/scripts/foo.js",
+            )
+            scan_skill_commands()
+            msg = build_skill_invocation_message("/no-vars")
+
+        assert msg is not None
+        assert "${HERMES_SKILL_DIR}" in msg
+        assert "${HERMES_SESSION_ID}" not in msg
+        # The timeout/inline-shell tests below exercise real (non-mocked) shell
+        # execution, so they gate on a ``CI`` / ``SKIP_SLOW`` / ``--runslow`` guard.
+
+    def test_timeout_marker_replaces_full_output(self, tmp_path):
+        """When shell execution hits the inline timeout, the partial output is
+        dropped and a timeout marker replaces it."""
+        if os.environ.get("CI") or os.environ.get("SKIP_SLOW"):
+            pytest.skip("slow shell execution test")
+
+        import subprocess
+        from unittest.mock import patch as _patch
+
+        with _patch("agent.skill_commands.INLINE_SHELL_TIMEOUT", 0.1):
+            msg = build_skill_invocation_message(
+                "/timeout-test",
+                "run sleep 5 && printf DYN_MARKER",
+                timeout=0.1,
+            )
+
+        assert msg is not None
+        # Timeout is surfaced as a marker instead of propagating as an error,
+        # and the rest of the skill message still renders.
+        assert "inline-shell timeout" in msg
+        # The command's intended stdout never made it through — only the
+        # timeout marker (which echoes the command text) survives.
+        assert "DYN_MARKER" not in msg.replace("sleep 5 && printf DYN_MARKER", "")
