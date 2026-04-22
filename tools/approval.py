@@ -19,6 +19,37 @@ import unicodedata
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+try:
+    from agent.runtime_signals import (
+        RuntimeSignalRef,
+        emit_runtime_signal,
+        make_runtime_signal,
+    )
+    from agent.runtime_policy import Provenance
+except Exception:
+    emit_runtime_signal = None
+    RuntimeSignalRef = None
+    Provenance = None
+    make_runtime_signal = None
+
+
+def _emit_approval_signal(event_type: str, phase: str, payload: dict, session_key: str = ""):
+    if emit_runtime_signal is None:
+        return
+    try:
+        signal = make_runtime_signal(
+            event_type=event_type,
+            phase=phase,  # type: ignore[arg-type]
+            publisher="tools.approval",
+            session_id=session_key or None,
+            payload=payload,
+            provenance=Provenance.trusted if Provenance else "system",
+            subject=RuntimeSignalRef(kind="approval", id=session_key) if RuntimeSignalRef else None,
+        )
+        emit_runtime_signal(signal, logger=logger)
+    except Exception:
+        pass
+  
 
 # Per-thread/per-task gateway session identity.
 # Gateway runs agent turns concurrently in executor threads, so reading a
@@ -623,6 +654,13 @@ def check_dangerous_command(command: str, env_type: str,
     if is_approved(session_key, pattern_key):
         return {"approved": True, "message": None}
 
+    _emit_approval_signal(
+        "approval.request",
+        "requested",
+        {"command": command, "pattern_key": pattern_key, "description": description},
+        session_key=session_key,
+    )
+
     is_cli = os.getenv("HERMES_INTERACTIVE")
     is_gateway = os.getenv("HERMES_GATEWAY_SESSION")
 
@@ -679,6 +717,12 @@ def check_dangerous_command(command: str, env_type: str,
         approve_permanent(pattern_key)
         save_permanent_allowlist(_permanent_approved)
 
+    _emit_approval_signal(
+        "approval.request",
+        "approved",
+        {"command": command, "pattern_key": pattern_key, "description": description, "choice": choice},
+        session_key=session_key,
+    )
     return {"approved": True, "message": None}
 
 
@@ -798,7 +842,13 @@ def check_all_command_guards(command: str, env_type: str,
     # Nothing to warn about
     if not warnings:
         return {"approved": True, "message": None}
-
+    
+    _emit_approval_signal(
+        "approval.request",
+        "requested",
+        {"command": command, "pattern_keys": [key for key, _, _ in warnings], "description": "; ".join(desc for _, desc, _ in warnings)},
+        session_key=session_key,
+    )
     # --- Phase 2.5: Smart approval (auxiliary LLM risk assessment) ---
     # When approvals.mode=smart, ask the aux LLM before prompting the user.
     # Inspired by OpenAI Codex's Smart Approvals guardian subagent
@@ -816,6 +866,12 @@ def check_all_command_guards(command: str, env_type: str,
                     "smart_approved": True,
                     "description": combined_desc_for_llm}
         elif verdict == "deny":
+            _emit_approval_signal(
+                "approval.request",
+                "rejected",
+                {"command": command, "description": "; ".join(desc for _, desc, _ in warnings), "verdict": "smart_denied"},
+                session_key=session_key,
+            )
             combined_desc_for_llm = "; ".join(desc for _, desc, _ in warnings)
             return {
                 "approved": False,
@@ -970,11 +1026,17 @@ def check_all_command_guards(command: str, env_type: str,
                                        approval_callback=approval_callback)
 
     if choice == "deny":
+        _emit_approval_signal(
+            "approval.request",
+            "rejected",
+            {"command": command, "pattern_key": warnings[0][0], "description": "; ".join(desc for _, desc, _ in warnings), "choice": "deny"},
+            session_key=session_key,
+        )
         return {
             "approved": False,
             "message": "BLOCKED: User denied. Do NOT retry.",
-            "pattern_key": primary_key,
-            "description": combined_desc,
+            "pattern_key": warnings[0][0],
+            "description": "; ".join(desc for _, desc, _ in warnings),
         }
 
     # Persist approval for each warning individually
@@ -988,8 +1050,14 @@ def check_all_command_guards(command: str, env_type: str,
             approve_permanent(key)
             save_permanent_allowlist(_permanent_approved)
 
+    _emit_approval_signal(
+        "approval.request",
+        "approved",
+        {"command": command, "pattern_keys": [key for key, _, _ in warnings], "description": "; ".join(desc for _, desc, _ in warnings), "choice": choice},
+        session_key=session_key,
+    )
     return {"approved": True, "message": None,
-            "user_approved": True, "description": combined_desc}
+            "user_approved": True, "description": "; ".join(desc for _, desc, _ in warnings)}
 
 
 # Load permanent allowlist from config on module import

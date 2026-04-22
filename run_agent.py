@@ -115,6 +115,8 @@ from agent.runtime_signals import (
     requested_signal,
     started_signal,
 )
+from agent.runtime_policy import Capability, PolicyMode, Provenance, RuntimePolicy
+from agent.runtime_policy import strip_provider_metadata as _strip_provider_metadata
 from utils import atomic_json_write, env_var_enabled
 
 
@@ -1696,6 +1698,10 @@ class AIAgent:
                 "is_anthropic_oauth": self._is_anthropic_oauth,
             })
 
+        # CaMeL-style runtime policy — default off so existing behavior is unchanged.
+        self._runtime_policy = RuntimePolicy()
+        self._policy_mode = PolicyMode.off
+    
     def reset_session_state(self):
         """Reset all session-scoped token counters to 0 for a fresh session.
         
@@ -3122,6 +3128,7 @@ class AIAgent:
         mission_id: Optional[str] = None,
         subject: Optional[RuntimeSignalRef] = None,
         idempotency_key: Optional[str] = None,
+        provenance: Optional[str] = None,
         hook_name: Optional[str] = None,
         hook_kwargs: Optional[Dict[str, Any]] = None,
         hook_invoker: Any = None,
@@ -3129,7 +3136,6 @@ class AIAgent:
         hook_failure_log_level: str = "warning",
     ) -> Any:
         signal_factory = {
-            "requested": requested_signal,
             "started": started_signal,
             "completed": completed_signal,
             "failed": failed_signal,
@@ -3143,6 +3149,7 @@ class AIAgent:
             correlation_id=correlation_id or self.session_id or str(uuid.uuid4()),
             actor=self._runtime_signal_subject("agent_session", self.session_id or None),
             subject=subject,
+            provenance=provenance or "system",
             payload=payload,
             idempotency_key=idempotency_key,
         )
@@ -3156,6 +3163,15 @@ class AIAgent:
             logger=logger,
             hook_failure_log_level=hook_failure_log_level,
         )
+    def _check_tool_policy(self, function_name: str, provenance: str = "untrusted") -> Optional[str]:
+        """Return a block reason if the tool is disallowed by runtime policy."""
+        capability = self._runtime_policy.capability_for_tool(function_name)
+        if capability is None:
+            return None
+        result = self._runtime_policy.evaluate(capability, provenance, self._policy_mode)
+        if result.get("blocked"):
+            return result.get("reason")
+        return None
 
     def _current_mission_id(self) -> Optional[str]:
         if not self._mission_service or not self.session_id:
@@ -3207,6 +3223,7 @@ class AIAgent:
                 **self._runtime_signal_argument_summary(function_args),
             },
             subject=self._runtime_signal_subject("tool", function_name),
+            provenance=Provenance.untrusted,
             hook_name="pre_tool_call",
             hook_kwargs=hook_kwargs,
             hook_invoker=self._resolve_pre_tool_block_message,
@@ -3251,6 +3268,7 @@ class AIAgent:
                 **self._runtime_signal_argument_summary(function_args),
             },
             subject=self._runtime_signal_subject("tool", function_name),
+            provenance=Provenance.untrusted,
             hook_name="post_tool_call" if invoke_hook else None,
             hook_kwargs=hook_kwargs if invoke_hook else None,
             hook_failure_log_level="debug",
@@ -7735,6 +7753,7 @@ class AIAgent:
                 api_msg.pop("finish_reason", None)
                 api_msg.pop("_flush_sentinel", None)
                 api_msg.pop("_thinking_prefill", None)
+                api_msg.pop("_provenance", None)
                 if _needs_sanitize:
                     self._sanitize_tool_calls_for_strict_api(api_msg)
                 api_messages.append(api_msg)
@@ -8453,6 +8472,7 @@ class AIAgent:
                 "role": "tool",
                 "content": function_result,
                 "tool_call_id": tc.id,
+                "_provenance": "untrusted",
             }
             messages.append(tool_msg)
 
@@ -8860,7 +8880,8 @@ class AIAgent:
             tool_msg = {
                 "role": "tool",
                 "content": function_result,
-                "tool_call_id": tool_call.id
+                "tool_call_id": tool_call.id,
+                "_provenance": "untrusted",
             }
             messages.append(tool_msg)
 
@@ -8919,7 +8940,7 @@ class AIAgent:
             api_messages = []
             for msg in messages:
                 api_msg = msg.copy()
-                for internal_field in ("reasoning", "finish_reason", "_thinking_prefill"):
+                for internal_field in ("reasoning", "finish_reason", "_thinking_prefill", "_provenance"):
                     api_msg.pop(internal_field, None)
                 if _needs_sanitize:
                     self._sanitize_tool_calls_for_strict_api(api_msg)
@@ -9265,6 +9286,7 @@ class AIAgent:
                         "new_session": True,
                     },
                     subject=self._runtime_signal_subject("session", self.session_id or None),
+                    provenance=Provenance.trusted,
                     hook_name="on_session_start",
                     hook_kwargs={
                         "session_id": self.session_id,

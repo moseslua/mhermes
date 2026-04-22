@@ -454,6 +454,7 @@ class SessionDB:
         cursor.executescript(SCHEMA_SQL)
         cursor.executescript(RUNTIME_SIGNAL_AUDIT_SQL)
         cursor.executescript(DOMAIN_STATE_SQL)
+        cursor.executescript(MISSION_STATE_SQL)
         # Check schema version and run migrations
         cursor.execute("SELECT version FROM schema_version LIMIT 1")
         row = cursor.fetchone()
@@ -1340,6 +1341,70 @@ class SessionDB:
                 params,
             ).fetchall()
         return [self._runtime_signal_row_to_dict(row) for row in rows]
+    # =========================================================================
+    # Projection cursors
+    # =========================================================================
+
+    def get_projection_cursor(self, projection_type: str) -> Optional[Dict[str, Any]]:
+        """Load the cursor for *projection_type*, or None if never run."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, projection_type, last_applied_audit_id, last_snapshot_hash, "
+                "last_projection_version, updated_at FROM projection_cursors "
+                "WHERE projection_type = ?",
+                (projection_type,)
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "id": row["id"],
+            "projection_type": row["projection_type"],
+            "last_applied_audit_id": row["last_applied_audit_id"],
+            "last_snapshot_hash": row["last_snapshot_hash"],
+            "last_projection_version": row["last_projection_version"],
+            "updated_at": row["updated_at"],
+        }
+
+    def set_projection_cursor(
+        self,
+        projection_type: str,
+        *,
+        last_applied_audit_id: int,
+        last_snapshot_hash: Optional[str] = None,
+        last_projection_version: Optional[int] = None,
+    ) -> None:
+        """Upsert a projection cursor after a successful projection batch."""
+        import uuid
+        now = time.time()
+        version = (last_projection_version or 0) + 1
+
+        def _do(conn):
+            conn.execute(
+                """INSERT INTO projection_cursors 
+                    (id, projection_type, last_applied_audit_id, last_snapshot_hash,
+                     last_projection_version, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(projection_type) DO UPDATE SET
+                    last_applied_audit_id = excluded.last_applied_audit_id,
+                    last_snapshot_hash = excluded.last_snapshot_hash,
+                    last_projection_version = excluded.last_projection_version,
+                    updated_at = excluded.updated_at""",
+                (
+                    str(uuid.uuid4()),
+                    projection_type,
+                    last_applied_audit_id,
+                    last_snapshot_hash,
+                    version,
+                    now,
+                ),
+            )
+        self._execute_write(_do)
+
+    def reset_projection_cursor(self, projection_type: str) -> None:
+        """Delete the cursor for *projection_type* so the next run starts from scratch."""
+        def _do(conn):
+            conn.execute("DELETE FROM projection_cursors WHERE projection_type = ?", (projection_type,))
+        self._execute_write(_do)
 
 
     # =========================================================================
@@ -1737,3 +1802,178 @@ class SessionDB:
             return len(session_ids)
 
         return self._execute_write(_do)
+
+
+    # =========================================================================
+    # Proposals
+    # =========================================================================
+
+    def create_proposal(
+        self,
+        proposal_id: str,
+        session_id: str,
+        proposal_type: str,
+        title: str,
+        description: str = "",
+        status: str = "pending",
+        scaffold_path: str = None,
+    ) -> str:
+        """Create a proposal record. Returns the proposal_id."""
+        now = time.time()
+
+        def _do(conn):
+            conn.execute(
+                """INSERT INTO proposals (id, session_id, proposal_type, title,
+                   description, status, scaffold_path, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (proposal_id, session_id, proposal_type, title, description,
+                 status, scaffold_path, now, now),
+            )
+        self._execute_write(_do)
+        return proposal_id
+
+    def get_proposal(self, proposal_id: str) -> Optional[Dict[str, Any]]:
+        """Get a proposal by ID."""
+        with self._lock:
+            cursor = self._conn.execute(
+                "SELECT * FROM proposals WHERE id = ?", (proposal_id,)
+            )
+            row = cursor.fetchone()
+        return dict(row) if row else None
+
+    def list_proposals(
+        self,
+        session_id: str = None,
+        status: str = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """List proposals, optionally filtered by session_id and/or status."""
+        where_clauses = []
+        params = []
+        if session_id is not None:
+            where_clauses.append("session_id = ?")
+            params.append(session_id)
+        if status is not None:
+            where_clauses.append("status = ?")
+            params.append(status)
+        where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+        query = f"SELECT * FROM proposals {where_sql} ORDER BY created_at DESC LIMIT ? OFFSET ?"
+        params.extend([limit, 0])
+        with self._lock:
+            cursor = self._conn.execute(query, params)
+            rows = cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    def update_proposal_status(
+        self, proposal_id: str, status: str, reviewed_at: float = None
+    ) -> bool:
+        """Update a proposal's status. Returns True if the row existed."""
+        now = time.time()
+        reviewed = reviewed_at if reviewed_at is not None else now
+
+        def _do(conn):
+            cursor = conn.execute(
+                """UPDATE proposals SET status = ?, updated_at = ?,
+                   reviewed_at = COALESCE(?, reviewed_at) WHERE id = ?""",
+                (status, now, reviewed, proposal_id),
+            )
+            return cursor.rowcount
+        return self._execute_write(_do) > 0
+
+    def delete_proposal(self, proposal_id: str) -> bool:
+        """Delete a proposal by ID."""
+        def _do(conn):
+            cursor = conn.execute("DELETE FROM proposals WHERE id = ?", (proposal_id,))
+            return cursor.rowcount
+        return self._execute_write(_do) > 0
+
+    # =========================================================================
+    # Model mutations
+    # =========================================================================
+
+    def create_model_mutation(
+        self,
+        mutation_id: str,
+        session_id: str,
+        key: str,
+        old_value: str,
+        new_value: str,
+        status: str = "pending",
+    ) -> str:
+        """Create a model mutation record. Returns the mutation_id."""
+        now = time.time()
+
+        def _do(conn):
+            conn.execute(
+                """INSERT INTO model_mutations (id, session_id, key, old_value,
+                   new_value, status, rollback_value, requested_at, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (mutation_id, session_id, key, old_value, new_value,
+                 status, old_value, now, now, now),
+            )
+        self._execute_write(_do)
+        return mutation_id
+
+    def get_model_mutation(self, mutation_id: str) -> Optional[Dict[str, Any]]:
+        """Get a model mutation by ID."""
+        with self._lock:
+            cursor = self._conn.execute(
+                "SELECT * FROM model_mutations WHERE id = ?", (mutation_id,)
+            )
+            row = cursor.fetchone()
+        return dict(row) if row else None
+
+    def list_model_mutations(
+        self,
+        session_id: str = None,
+        status: str = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """List model mutations, optionally filtered."""
+        where_clauses = []
+        params = []
+        if session_id is not None:
+            where_clauses.append("session_id = ?")
+            params.append(session_id)
+        if status is not None:
+            where_clauses.append("status = ?")
+            params.append(status)
+        where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+        query = f"SELECT * FROM model_mutations {where_sql} ORDER BY created_at DESC LIMIT ? OFFSET ?"
+        params.extend([limit, 0])
+        with self._lock:
+            cursor = self._conn.execute(query, params)
+            rows = cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    def update_model_mutation_status(
+        self,
+        mutation_id: str,
+        status: str,
+        rollback_value: str = None,
+    ) -> bool:
+        """Update a model mutation's status. Returns True if the row existed."""
+        now = time.time()
+
+        def _do(conn):
+            if rollback_value is not None:
+                cursor = conn.execute(
+                    """UPDATE model_mutations SET status = ?, updated_at = ?,
+                       rollback_value = ? WHERE id = ?""",
+                    (status, now, rollback_value, mutation_id),
+                )
+            else:
+                cursor = conn.execute(
+                    """UPDATE model_mutations SET status = ?, updated_at = ?
+                       WHERE id = ?""",
+                    (status, now, mutation_id),
+                )
+            return cursor.rowcount
+        return self._execute_write(_do) > 0
+
+    def delete_model_mutation(self, mutation_id: str) -> bool:
+        """Delete a model mutation by ID."""
+        def _do(conn):
+            cursor = conn.execute("DELETE FROM model_mutations WHERE id = ?", (mutation_id,))
+            return cursor.rowcount
+        return self._execute_write(_do) > 0

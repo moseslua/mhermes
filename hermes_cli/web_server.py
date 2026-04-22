@@ -756,16 +756,35 @@ async def get_env_vars():
 @app.put("/api/env")
 async def set_env_var(body: EnvVarUpdate):
     try:
+        from agent.model_ops import ModelOpsService
+        if ModelOpsService.is_protected_key(body.key):
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    f"{body.key} is a protected model-identity key. "
+                    "Use ModelOpsService or the dedicated model-switch endpoint."
+                ),
+            )
         save_env_value(body.key, body.value)
         return {"ok": True, "key": body.key}
+    except HTTPException:
+        raise
     except Exception as e:
         _log.exception("PUT /api/env failed")
         raise HTTPException(status_code=500, detail="Internal server error")
 
-
 @app.delete("/api/env")
 async def remove_env_var(body: EnvVarDelete):
     try:
+        from agent.model_ops import ModelOpsService
+        if ModelOpsService.is_protected_key(body.key):
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    f"{body.key} is a protected model-identity key. "
+                    "Use ModelOpsService or the dedicated model-switch endpoint."
+                ),
+            )
         removed = remove_env_value(body.key)
         if not removed:
             raise HTTPException(status_code=404, detail=f"{body.key} not found in .env")
@@ -775,7 +794,6 @@ async def remove_env_var(body: EnvVarDelete):
     except Exception as e:
         _log.exception("DELETE /api/env failed")
         raise HTTPException(status_code=500, detail="Internal server error")
-
 
 @app.post("/api/env/reveal")
 async def reveal_env_var(body: EnvVarReveal, request: Request):

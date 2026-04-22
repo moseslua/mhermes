@@ -140,6 +140,24 @@ def get_subprocess_home() -> str | None:
 
 VALID_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
 
+def get_fabric_dir() -> Path:
+    """Return the Fabric projection directory under HERMES_HOME."""
+    return get_hermes_home() / "fabric"
+
+
+def get_obsidian_vault_dir() -> Path:
+    """Return the default Obsidian vault projection directory under HERMES_HOME."""
+    return get_hermes_home() / "obsidian"
+
+
+def get_projection_dir(projection_type: str) -> Path:
+    """Return a projection scratch directory for *projection_type* under HERMES_HOME.
+
+    Used for staging temporary files before atomic rename to the final target.
+    """
+    return get_hermes_home() / "projections" / projection_type
+
+
 
 def parse_reasoning_effort(effort: str) -> dict | None:
     """Parse a reasoning effort level into a config dict.

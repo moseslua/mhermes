@@ -1,0 +1,33 @@
+# Fly.io app configuration for Hermes Agent
+# Deploy: fly deploy --config packaging/fly/fly.toml
+
+app = "hermes-agent"
+primary_region = "iad"
+
+[build]
+  dockerfile = "packaging/fly/Dockerfile"
+
+[env]
+  PYTHONUNBUFFERED = "1"
+  HERMES_HOME = "/data/.hermes"
+
+[http_service]
+  internal_port = 9119
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [http_service.concurrency]
+    type = "connections"
+    hard_limit = 100
+    soft_limit = 50
+
+[[ mounts ]]
+  source = "hermes_data"
+  destination = "/data/.hermes"
+
+[[vm]]
+  memory = "1gb"
+  cpu_kind = "shared"
+  cpus = 1

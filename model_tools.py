@@ -30,6 +30,18 @@ from tools.registry import discover_builtin_tools, registry
 from toolsets import resolve_toolset, validate_toolset
 
 logger = logging.getLogger(__name__)
+from agent.runtime_signals import (
+    RuntimeSignalRef,
+    completed_signal,
+    emit_runtime_signal,
+    failed_signal,
+    make_runtime_signal,
+    requested_signal,
+    started_signal,
+    blocked_signal,
+)
+from agent.runtime_policy import Provenance
+
 
 
 # =============================================================================
@@ -475,6 +487,25 @@ def handle_function_call(
             # behavior (for example run_agent._invoke_tool). Skip here to avoid
             # double-firing plugin hooks on the same logical tool call.
             pass
+        # Emit runtime signal for tool call (covers sandboxed calls too)
+        try:
+            signal = requested_signal(
+                event_type="tool.call",
+                publisher="model_tools.handle_function_call",
+                session_id=session_id,
+                payload={
+                    "tool_name": function_name,
+                    "args_keys": list(function_args.keys()) if isinstance(function_args, dict) else [],
+                },
+                provenance=Provenance.untrusted,
+                subject=RuntimeSignalRef(kind="tool", id=function_name),
+            )
+            emit_runtime_signal(signal, logger=logger)
+        except Exception:
+            pass
+
+        result = None
+        phase = "completed"
 
         # Notify the read-loop tracker when a non-read/search tool runs,
         # so the *consecutive* counter resets (reads after other work are fine).
@@ -500,6 +531,21 @@ def handle_function_call(
                 task_id=task_id,
                 user_task=user_task,
             )
+        try:
+            signal = completed_signal(
+                event_type="tool.call",
+                publisher="model_tools.handle_function_call",
+                session_id=session_id,
+                payload={
+                    "tool_name": function_name,
+                    "result_length": len(result) if result else 0,
+                },
+                provenance=Provenance.untrusted,
+                subject=RuntimeSignalRef(kind="tool", id=function_name),
+            )
+            emit_runtime_signal(signal, logger=logger)
+        except Exception:
+            pass
 
         try:
             from hermes_cli.plugins import invoke_hook
